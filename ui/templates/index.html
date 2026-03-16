@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRISM — Security Analysis Dashboard</title>
+
+<!-- vis.js for graph rendering (CDN, no build step needed) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
+<link  rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css">
+
+<style>
+/* ── Reset & base ────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:         #0f172a;
+  --surface:    #1e293b;
+  --surface2:   #263148;
+  --border:     #334155;
+  --text:       #e2e8f0;
+  --text-dim:   #94a3b8;
+  --accent:     #3b82f6;
+  --green:      #22c55e;
+  --red:        #ef4444;
+  --amber:      #f59e0b;
+  --purple:     #a78bfa;
+  --font-mono:  'Menlo', 'Consolas', 'Courier New', monospace;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; }
+
+/* ── Layout ───────────────────────────────────────────────────────────────── */
+#app { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
+#header { display: flex; align-items: center; gap: 12px; padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
+#header h1 { font-size: 18px; font-weight: 700; letter-spacing: 0.05em; color: var(--accent); }
+#header .tagline { color: var(--text-dim); font-size: 12px; }
+#vault-badge { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+#vault-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+#vault-dot.ok { background: var(--green); }
+
+#main { display: grid; grid-template-columns: 360px 1fr; overflow: hidden; }
+
+/* ── Left panel ───────────────────────────────────────────────────────────── */
+#left-panel { display: flex; flex-direction: column; border-right: 1px solid var(--border); overflow: hidden; }
+
+#input-section { padding: 16px; border-bottom: 1px solid var(--border); }
+#input-section h2 { font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+
+label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; margin-top: 10px; }
+label:first-of-type { margin-top: 0; }
+input[type="text"], input[type="password"] {
+  width: 100%; padding: 7px 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 13px; outline: none;
+  transition: border-color 0.15s;
+}
+input:focus { border-color: var(--accent); }
+
+#analyze-btn {
+  margin-top: 14px; width: 100%; padding: 9px;
+  background: var(--accent); border: none; border-radius: 6px;
+  color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: opacity 0.15s;
+}
+#analyze-btn:hover:not(:disabled) { opacity: 0.85; }
+#analyze-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── Progress bar ─────────────────────────────────────────────────────────── */
+#progress-section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.stage-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+.stage-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+.stage-dot.active { background: var(--amber); animation: pulse 1s infinite; }
+.stage-dot.done   { background: var(--green); }
+.stage-dot.error  { background: var(--red); }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+#progress-bar-wrap { height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px; }
+#progress-bar { height: 100%; background: var(--accent); border-radius: 2px; width: 0%; transition: width 0.4s; }
+
+/* ── Log console ──────────────────────────────────────────────────────────── */
+#log-section { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#log-section h2 { padding: 10px 16px 6px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+#log-output {
+  flex: 1; overflow-y: auto; padding: 4px 12px 12px;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+}
+.log-line { margin: 1px 0; }
+.log-line.info    { color: var(--text); }
+.log-line.warning { color: var(--amber); }
+.log-line.error   { color: var(--red); }
+.log-line.debug   { color: var(--text-dim); }
+.log-ts { color: #475569; margin-right: 6px; }
+
+/* ── Right panel ──────────────────────────────────────────────────────────── */
+#right-panel { display: grid; grid-template-rows: 1fr 220px; overflow: hidden; }
+
+/* ── Graph canvas ─────────────────────────────────────────────────────────── */
+#graph-section { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+#graph-toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
+#graph-toolbar h2 { font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+.btn-sm {
+  padding: 4px 10px; font-size: 12px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text); border-radius: 4px; cursor: pointer;
+}
+.btn-sm:hover { background: var(--border); }
+#graph-stats { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+
+#graph-canvas { flex: 1; background: var(--bg); position: relative; }
+#graph-canvas .vis-network { background: var(--bg) !important; }
+#graph-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-dim); gap: 8px; }
+#graph-empty svg { opacity: 0.3; }
+
+/* Legend */
+#legend { display: flex; gap: 14px; padding: 0 14px; align-items: center; }
+.legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+/* Node tooltip panel */
+#node-info {
+  position: absolute; right: 10px; top: 10px;
+  width: 240px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px; font-size: 12px; display: none;
+  z-index: 10; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+#node-info h3 { font-size: 13px; margin-bottom: 8px; color: var(--accent); }
+.ni-row { display: flex; justify-content: space-between; margin: 3px 0; }
+.ni-label { color: var(--text-dim); }
+.ni-value { font-family: var(--font-mono); color: var(--text); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-SINK      { background: #7f1d1d; color: #fca5a5; }
+.badge-SOURCE    { background: #1e3a5f; color: #93c5fd; }
+.badge-SANITIZER { background: #14532d; color: #86efac; }
+.badge-SENSITIVE { background: #78350f; color: #fcd34d; }
+.badge-NONE      { background: #1e293b; color: #94a3b8; }
+
+/* ── Findings panel ───────────────────────────────────────────────────────── */
+#findings-section { border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+#findings-section h2 { padding: 8px 14px 4px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; flex-shrink: 0; }
+#findings-list { flex: 1; overflow-y: auto; padding: 0 12px 10px; }
+.finding-card {
+  margin: 6px 0; padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; transition: border-color 0.15s;
+  display: grid; grid-template-columns: 1fr auto; gap: 4px;
+}
+.finding-card:hover { border-color: var(--accent); }
+.finding-card.highlight { border-color: var(--accent); background: var(--surface2); }
+.finding-name { font-weight: 600; font-size: 13px; }
+.finding-loc { color: var(--text-dim); font-size: 11px; font-family: var(--font-mono); }
+.finding-cwe { font-size: 11px; color: var(--purple); margin-top: 2px; }
+.finding-snippet { font-size: 11px; font-family: var(--font-mono); color: var(--text-dim); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1/-1; }
+.conf-bar { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-dim); }
+.conf-fill { height: 4px; border-radius: 2px; }
+.findings-empty { color: var(--text-dim); text-align: center; padding: 20px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header id="header">
+    <div style="display:flex;flex-direction:column;">
+      <h1>PRISM</h1>
+      <span class="tagline">Zero-Trust Code Analysis Platform</span>
+    </div>
+    <div id="vault-badge">
+      <div id="vault-dot"></div>
+      <span id="vault-status">Vault: checking…</span>
+    </div>
+  </header>
+
+  <div id="main">
+
+    <!-- ── Left panel ───────────────────────────────────────────────────── -->
+    <aside id="left-panel">
+
+      <!-- Input form -->
+      <section id="input-section">
+        <h2>Repository Analysis</h2>
+
+        <label for="repo-url">GitHub Repository URL</label>
+        <input type="text" id="repo-url" placeholder="https://github.com/owner/repo" value="">
+
+        <label for="branch">Branch</label>
+        <input type="text" id="branch" placeholder="main" value="main">
+
+        <label for="commit-sha">Commit SHA <span style="color:#475569">(optional — pins to exact commit)</span></label>
+        <input type="text" id="commit-sha" placeholder="Leave blank to use branch HEAD">
+
+        <label for="github-token">GitHub Personal Access Token</label>
+        <input type="password" id="github-token" placeholder="ghp_…  (stored in memory only, never logged)">
+
+        <button id="analyze-btn" onclick="startAnalysis()">▶  Analyze Repository</button>
+      </section>
+
+      <!-- Stage progress -->
+      <section id="progress-section">
+        <div id="stages">
+          <div class="stage-row"><div class="stage-dot" id="dot-init"></div><span>Initialisation</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-credential"></div><span>Credential acquisition</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-ingestion"></div><span>Repository ingestion + integrity</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-parsing"></div><span>CPG construction (Joern · Tree-sitter)</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-graph"></div><span>Security analysis + SARIF injection</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-done"></div><span>Complete</span></div>
+        </div>
+        <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+      </section>
+
+      <!-- Log console -->
+      <section id="log-section">
+        <h2>Pipeline Log</h2>
+        <div id="log-output"></div>
+      </section>
+
+    </aside>
+
+    <!-- ── Right panel ──────────────────────────────────────────────────── -->
+    <main id="right-panel">
+
+      <!-- Graph area -->
+      <section id="graph-section">
+        <div id="graph-toolbar">
+          <h2>Code Property Graph</h2>
+          <div id="legend">
+            <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>SINK</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>SOURCE</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>SANITIZER</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>SENSITIVE</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>OTHER</div>
+            <div class="legend-item"><div style="width:20px;height:2px;background:#fb923c"></div>DFG</div>
+            <div class="legend-item"><div style="width:20px;height:2px;background:#60a5fa;border-top: 2px dashed #60a5fa;margin-top:-2px"></div>CFG</div>
+          </div>
+          <div id="graph-stats" style="margin-left:auto"></div>
+          <button class="btn-sm" onclick="fitGraph()">Fit</button>
+          <button class="btn-sm" onclick="togglePhysics()">Physics</button>
+          <button class="btn-sm" onclick="filterSinks()">Sinks only</button>
+          <button class="btn-sm" onclick="resetFilter()">Show all</button>
+        </div>
+        <div id="graph-canvas" style="position:relative;flex:1;">
+          <div id="graph-empty">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/>
+              <circle cx="12" cy="19" r="2"/>
+              <line x1="7" y1="5" x2="17" y2="5"/>
+              <line x1="5.7" y1="7" x2="11" y2="17"/>
+              <line x1="18.3" y1="7" x2="13" y2="17"/>
+            </svg>
+            <span>Run an analysis to see the Code Property Graph</span>
+          </div>
+          <div id="node-info">
+            <h3 id="ni-name">—</h3>
+            <div class="ni-row"><span class="ni-label">Type</span><span class="ni-value" id="ni-type"></span></div>
+            <div class="ni-row"><span class="ni-label">Security</span><span id="ni-label-badge"></span></div>
+            <div class="ni-row"><span class="ni-label">File</span><span class="ni-value" id="ni-file"></span></div>
+            <div class="ni-row"><span class="ni-label">Line</span><span class="ni-value" id="ni-line"></span></div>
+            <div class="ni-row"><span class="ni-label">CWE</span><span class="ni-value" id="ni-cwe"></span></div>
+            <div class="ni-row"><span class="ni-label">Backend</span><span class="ni-value" id="ni-backend"></span></div>
+            <div style="margin-top:8px;font-size:11px;color:var(--text-dim);font-family:var(--font-mono);word-break:break-all" id="ni-snippet"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Findings panel -->
+      <section id="findings-section">
+        <h2>Vulnerability Findings <span id="findings-count" style="color:var(--red);font-size:11px;font-weight:400"></span></h2>
+        <div id="findings-list">
+          <div class="findings-empty">No findings yet — run an analysis.</div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+let network       = null;
+let allNodes      = null;
+let allEdges      = null;
+let currentSession = null;
+let physicsOn      = true;
+
+// ── Vault status ──────────────────────────────────────────────────────────
+async function checkVault() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    const dot  = document.getElementById('vault-dot');
+    const span = document.getElementById('vault-status');
+    if (d.vault_connected) {
+      dot.classList.add('ok');
+      span.textContent = `Vault: connected (${d.vault_addr})`;
+    } else {
+      span.textContent = `Vault: offline (env fallback active)`;
+    }
+  } catch(e) {}
+}
+checkVault();
+setInterval(checkVault, 30000);
+
+// ── Start analysis ────────────────────────────────────────────────────────
+async function startAnalysis() {
+  const repoUrl    = document.getElementById('repo-url').value.trim();
+  const branch     = document.getElementById('branch').value.trim() || 'main';
+  const commitSha  = document.getElementById('commit-sha').value.trim() || null;
+  const token      = document.getElementById('github-token').value;
+
+  if (!repoUrl) { appendLog('⚠️ Enter a repository URL first', 'warning'); return; }
+
+  clearUI();
+  document.getElementById('analyze-btn').disabled = true;
+
+  try {
+    const r = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo_url: repoUrl, branch, commit_sha: commitSha, github_token: token }),
+    });
+    const d = await r.json();
+    if (!r.ok) { appendLog(`❌ ${d.error || 'Request failed'}`, 'error'); enableBtn(); return; }
+    currentSession = d.session_id;
+    appendLog(`Session: ${currentSession}`, 'debug');
+    connectSSE(currentSession);
+  } catch(e) {
+    appendLog(`❌ ${e.message}`, 'error');
+    enableBtn();
+  }
+}
+
+// ── SSE connection ────────────────────────────────────────────────────────
+function connectSSE(sessionId) {
+  const es = new EventSource(`/api/session/${sessionId}/events`);
+
+  es.onmessage = (ev) => {
+    const data = JSON.parse(ev.data);
+
+    if (data.type === 'log') {
+      appendLog(data.message, data.level, data.stage);
+      if (data.stage) advanceStage(data.stage, data.level === 'error' ? 'error' : 'active');
+    }
+    else if (data.type === 'progress') {
+      document.getElementById('progress-bar').style.width = data.pct + '%';
+      if (data.stage) advanceStage(data.stage, 'active');
+    }
+    else if (data.type === 'heartbeat') {
+      // no-op, keeps connection alive
+    }
+    else if (data.type === 'final') {
+      if (data.status === 'complete') {
+        markAllDone();
+        document.getElementById('progress-bar').style.width = '100%';
+        renderGraph(data.graph);
+        renderFindings(data.findings || []);
+      } else {
+        appendLog(`❌ ${data.error || 'Analysis failed'}`, 'error');
+        markError();
+      }
+      enableBtn();
+      es.close();
+    }
+  };
+
+  es.onerror = () => {
+    appendLog('Connection closed', 'debug');
+    es.close();
+    enableBtn();
+  };
+}
+
+// ── Stage dots ─────────────────────────────────────────────────────────────
+const stageMap = {
+  init: 'dot-init', credential: 'dot-credential', ingestion: 'dot-ingestion',
+  parsing: 'dot-parsing', graph: 'dot-graph', done: 'dot-done',
+};
+let activeDot = null;
+
+function advanceStage(stage, state) {
+  const id = stageMap[stage];
+  if (!id) return;
+  if (activeDot && activeDot !== id) {
+    document.getElementById(activeDot).className = 'stage-dot done';
+  }
+  const dot = document.getElementById(id);
+  if (state === 'error') { dot.className = 'stage-dot error'; return; }
+  dot.className = 'stage-dot active';
+  activeDot = id;
+}
+
+function markAllDone() {
+  Object.values(stageMap).forEach(id => {
+    document.getElementById(id).className = 'stage-dot done';
+  });
+  activeDot = null;
+}
+
+function markError() {
+  if (activeDot) document.getElementById(activeDot).className = 'stage-dot error';
+}
+
+// ── Log output ─────────────────────────────────────────────────────────────
+function appendLog(msg, level = 'info', stage = '') {
+  const out   = document.getElementById('log-output');
+  const div   = document.createElement('div');
+  div.className = `log-line ${level}`;
+  const ts    = new Date().toLocaleTimeString('en-GB', {hour12:false});
+  div.innerHTML = `<span class="log-ts">${ts}</span>${escHtml(msg)}`;
+  out.appendChild(div);
+  out.scrollTop = out.scrollHeight;
+}
+
+// ── Graph rendering ────────────────────────────────────────────────────────
+function renderGraph(graphData) {
+  if (!graphData || !graphData.nodes) return;
+
+  document.getElementById('graph-empty').style.display = 'none';
+
+  const visNodes = new vis.DataSet(graphData.nodes);
+  const visEdges = new vis.DataSet(graphData.edges);
+  allNodes = visNodes;
+  allEdges = visEdges;
+
+  const container = document.getElementById('graph-canvas');
+  const options = {
+    nodes: {
+      font: { color: '#e2e8f0', size: 11 },
+      borderWidth: 1.5,
+    },
+    edges: {
+      smooth: { type: 'curvedCW', roundness: 0.15 },
+      font: { size: 10, color: '#64748b', align: 'middle' },
+      length: 120,
+    },
+    physics: {
+      enabled: true,
+      stabilization: { iterations: 80 },
+      barnesHut: { gravitationalConstant: -3000, springLength: 120 },
+    },
+    interaction: {
+      hover: true,
+      tooltipDelay: 100,
+      hideEdgesOnDrag: true,
+    },
+    layout: { improvedLayout: true },
+  };
+
+  if (network) { network.destroy(); network = null; }
+  network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+
+  network.on('selectNode', (params) => {
+    if (params.nodes.length === 0) return;
+    const node = visNodes.get(params.nodes[0]);
+    showNodeInfo(node);
+  });
+  network.on('deselectNode', () => { document.getElementById('node-info').style.display = 'none'; });
+
+  const s = graphData.summary || {};
+  document.getElementById('graph-stats').textContent =
+    `${s.node_count || 0} nodes · ${s.edge_count || 0} edges${s.truncated ? ' (truncated)' : ''}`;
+
+  // Log backend breakdown
+  if (s.backend_counts) {
+    const bc = Object.entries(s.backend_counts).map(([k,v]) => `${k}:${v}`).join('  ');
+    appendLog(`  Graph backends: ${bc}`, 'debug');
+  }
+  if (s.cwe_counts) {
+    const cc = Object.entries(s.cwe_counts).map(([k,v]) => `${k}×${v}`).join('  ');
+    if (cc) appendLog(`  CWEs detected: ${cc}`, 'info');
+  }
+}
+
+function showNodeInfo(node) {
+  if (!node || !node.meta) return;
+  const m = node.meta;
+  document.getElementById('ni-name').textContent = m.file_path
+    ? `${node.label.split('\n')[0] || node.id.slice(0,12)}`
+    : node.id.slice(0,16);
+  document.getElementById('ni-type').textContent    = m.node_type || '—';
+  document.getElementById('ni-file').textContent    = (m.file_path || '').split('/').pop() || '—';
+  document.getElementById('ni-line').textContent    = m.start_line ?? '—';
+  document.getElementById('ni-cwe').textContent     = (m.cwe_hints || []).join(', ') || '—';
+  document.getElementById('ni-backend').textContent = m.backend || '—';
+  document.getElementById('ni-snippet').textContent = m.raw_text || '';
+  const lbl  = m.security_label || 'NONE';
+  document.getElementById('ni-label-badge').innerHTML =
+    `<span class="badge badge-${lbl}">${lbl}</span>`;
+  document.getElementById('node-info').style.display = 'block';
+}
+
+function fitGraph() { if (network) network.fit({ animation: true }); }
+
+function togglePhysics() {
+  physicsOn = !physicsOn;
+  if (network) network.setOptions({ physics: { enabled: physicsOn } });
+}
+
+function filterSinks() {
+  if (!allNodes || !allEdges) return;
+  const sinkIds = allNodes.getIds().filter(id => {
+    const n = allNodes.get(id);
+    return n && n.meta && n.meta.security_label === 'SINK';
+  });
+  if (sinkIds.length === 0) return;
+
+  // Also include nodes connected to sinks via DFG edges
+  const connected = new Set(sinkIds);
+  allEdges.getIds().forEach(eid => {
+    const e = allEdges.get(eid);
+    if (e && (e.label === 'DFG_FLOW' || e.label === 'TAINT_SINK') && sinkIds.includes(e.to)) {
+      connected.add(e.from);
+    }
+  });
+  if (network) network.selectNodes([...connected]);
+  network.focus([...connected][0], { scale: 1.2, animation: true });
+}
+
+function resetFilter() { if (network) { network.unselectAll(); network.fit({ animation: true }); } }
+
+// ── Findings panel ─────────────────────────────────────────────────────────
+function renderFindings(findings) {
+  const list = document.getElementById('findings-list');
+  const cnt  = document.getElementById('findings-count');
+  list.innerHTML = '';
+
+  if (!findings || findings.length === 0) {
+    list.innerHTML = '<div class="findings-empty">No findings detected.</div>';
+    cnt.textContent = '';
+    return;
+  }
+
+  cnt.textContent = `— ${findings.length} finding${findings.length !== 1 ? 's' : ''}`;
+
+  findings.forEach(f => {
+    const card = document.createElement('div');
+    card.className = 'finding-card';
+    card.dataset.nodeId = f.node_id;
+
+    const confPct  = Math.round((f.confidence || 0) * 100);
+    const confColor = confPct >= 80 ? '#ef4444' : confPct >= 50 ? '#f59e0b' : '#6b7280';
+    const cweTxt   = (f.cwe_hints || []).join(' · ') || '';
+    const ruleTxt  = f.rule_id ? `  ·  ${f.rule_id}` : '';
+
+    card.innerHTML = `
+      <div>
+        <div class="finding-name">
+          <span class="badge badge-${f.label}">${f.label}</span>
+          &nbsp;${escHtml(f.name || f.node_id.slice(0,12))}
+        </div>
+        <div class="finding-loc">${escHtml((f.file_path||'').split('/').pop())}:${f.start_line}${ruleTxt}</div>
+        ${cweTxt ? `<div class="finding-cwe">${escHtml(cweTxt)}</div>` : ''}
+        <div class="finding-snippet">${escHtml(f.raw_text || '')}</div>
+      </div>
+      <div class="conf-bar" style="flex-direction:column;align-items:flex-end;gap:2px">
+        <span>${confPct}%</span>
+        <div style="width:40px;height:4px;background:var(--border);border-radius:2px">
+          <div class="conf-fill" style="width:${confPct}%;background:${confColor}"></div>
+        </div>
+      </div>`;
+
+    card.addEventListener('click', () => {
+      document.querySelectorAll('.finding-card').forEach(c => c.classList.remove('highlight'));
+      card.classList.add('highlight');
+      if (network && f.node_id) {
+        network.selectNodes([f.node_id]);
+        network.focus(f.node_id, { scale: 1.5, animation: true });
+        const node = allNodes && allNodes.get(f.node_id);
+        if (node) showNodeInfo(node);
+      }
+    });
+
+    list.appendChild(card);
+  });
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function clearUI() {
+  document.getElementById('log-output').innerHTML   = '';
+  document.getElementById('findings-list').innerHTML = '<div class="findings-empty">Waiting for analysis…</div>';
+  document.getElementById('findings-count').textContent = '';
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('graph-stats').textContent = '';
+  document.getElementById('node-info').style.display = 'none';
+  document.getElementById('graph-empty').style.display = 'flex';
+  if (network) { network.destroy(); network = null; }
+  Object.values(stageMap).forEach(id => {
+    document.getElementById(id).className = 'stage-dot';
+  });
+  activeDot = null;
+}
+
+function enableBtn() { document.getElementById('analyze-btn').disabled = false; }
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+</script>
+</body>
+</html>

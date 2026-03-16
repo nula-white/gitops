@@ -1,0 +1,69 @@
+version: "3.9"
+
+services:
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: prism-vault
+    restart: unless-stopped
+    user: root
+    ports:
+      - "8200:8200"     # API + UI
+      - "8201:8201"     # cluster port (unused in single-node, kept for future)
+
+    environment:
+      # Tell Vault where to find its config
+      VAULT_LOCAL_CONFIG: |
+        ui            = true
+        disable_mlock = true
+
+        listener "tcp" {
+          address       = "0.0.0.0:8200"
+          tls_disable   = true
+        }
+
+        storage "file" {
+          path = "/vault/data"
+        }
+
+        api_addr     = "http://0.0.0.0:8200"
+        cluster_addr = "http://0.0.0.0:8201"
+
+      # Used by the Vault CLI inside the container
+      VAULT_ADDR: "http://127.0.0.1:8200"
+
+    volumes:
+      # Persistent encrypted storage — never delete this volume in production
+      #- vault_data:/vault/data
+      # Vault logs for audit trail
+      #- vault_logs:/vault/logs
+      # Mount setup scripts as read-only
+      #- ./vault-init:/vault/init:ro
+      - ./data:/vault/data
+      - ./logs:/vault/logs
+      - ./vault-init:/vault/init:ro
+
+    cap_add:
+      - IPC_LOCK    # allows Vault to lock memory (prevents swap of secrets)
+
+    command: vault server -config=/vault/config
+
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - prism-internal
+
+    # Security hardening: drop all capabilities except IPC_LOCK
+    security_opt:
+      - no-new-privileges:true
+
+volumes: {}
+networks:
+  prism-internal:
+    name: prism-internal
+    driver: bridge
+    internal: false    # set to true in production to block external access

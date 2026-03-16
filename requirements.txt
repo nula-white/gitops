@@ -1,0 +1,39 @@
+# Tree-sitter: multi-language parsing (pre-compiled grammars for 40+ languages)
+# Covers: Python, Java, JS, TS, TSX, C, C++, Rust, Go, HCL, YAML
+tree-sitter-language-pack
+tree-sitter
+
+# Pydantic v2: DeploymentContext validation (used in IaC generation stage)
+pydantic
+
+# Testing
+pytest
+pytest-cov
+dulwich
+pygit2
+
+# Utilities
+pathlib2
+
+fastapi
+langgraph
+langchain
+dulwich
+pygit2
+hvac
+# ── CodeQL: installed separately (not via pip) ──────────────────────────────
+# Download from: https://github.com/github/codeql-cli-binaries/releases
+# Set env vars:
+#   CODEQL_CLI_PATH=/usr/local/bin/codeql
+#   CODEQL_SEARCH_PATH=/opt/codeql-home/codeql
+#
+# Clone libraries:
+#   git clone https://github.com/github/codeql /opt/codeql-home/codeql
+
+# ── Azure replacements (install as needed) ─────────────────────────────
+# Sandbox:     docker (system package) + gvisor (https://gvisor.dev/docs/user_guide/install/)
+hvac
+# Blockchain:  web3>=6.0.0  (Ganache local testnet)
+# Graph DB:    neo4j>=5.0.0  (or use Joern's built-in graph DB)
+# Monitoring:  prometheus-client>=0.17.0
+
