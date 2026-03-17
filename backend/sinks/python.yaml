@@ -1,0 +1,154 @@
+# backend/sinks/python.yaml
+#
+# Vulnerability sink patterns for Python.
+# Each entry drives both:
+#   1. Regex fallback detection  (sink_pattern, keywords)
+#   2. Neo4j DFG path query      (sources, sinks, sanitizers)
+#
+# node_types: which CPGNode.node_type values are eligible for this pattern.
+# sources:    variable name fragments that represent untrusted input origins.
+# sinks:      function/method name fragments that represent dangerous operations.
+# sanitizers: call fragments that break the taint chain (whitelist).
+
+patterns:
+
+  - vuln_type: "SQL Injection"
+    cwe: "CWE-89"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["execute", "query", "cursor.execute", "db.execute", ".raw("]
+    sink_pattern: '(execute|query|cursor\.execute|db\.execute|\.raw)\s*\('
+    sources: ["request", "args", "form", "params", "user_input", "data", "body", "GET", "POST"]
+    sinks: ["execute", "executemany", "raw", "query", "cursor"]
+    sanitizers: ["parameterize", "escape", "quote", "sanitize", "bleach"]
+    description: >
+      User-controlled data flows into a database query without parameterisation.
+      An attacker can alter the query structure to read, modify, or delete data.
+    remediation: >
+      Use parameterised queries or an ORM. Never concatenate user input into SQL strings.
+    references:
+      - "https://owasp.org/www-community/attacks/SQL_Injection"
+      - "https://cwe.mitre.org/data/definitions/89.html"
+
+  - vuln_type: "Command Injection"
+    cwe: "CWE-78"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["os.system", "subprocess", "popen", "shell=True", "exec"]
+    sink_pattern: '(os\.system|subprocess\.(run|Popen|call)|popen|shell\s*=\s*True)'
+    sources: ["request", "args", "form", "params", "user_input", "data", "environ", "argv"]
+    sinks: ["os.system", "popen", "subprocess.run", "subprocess.Popen", "subprocess.call", "exec", "eval"]
+    sanitizers: ["shlex.quote", "shlex.split", "pipes.quote"]
+    description: >
+      Unsanitised input is passed to a shell command.
+      An attacker can inject arbitrary OS commands.
+    remediation: >
+      Use subprocess with a list argument and shell=False. Validate and sanitise all inputs.
+    references:
+      - "https://owasp.org/www-community/attacks/Command_Injection"
+      - "https://cwe.mitre.org/data/definitions/78.html"
+
+  - vuln_type: "Path Traversal"
+    cwe: "CWE-22"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["open(", "os.path.join", "read_file", "send_file"]
+    sink_pattern: 'open\s*\(|os\.path\.join\s*\(|send_file\s*\('
+    sources: ["request", "args", "form", "params", "user_input", "filename", "path"]
+    sinks: ["open", "os.path.join", "send_file", "send_from_directory", "read_file", "os.open"]
+    sanitizers: ["os.path.realpath", "os.path.abspath", "os.path.basename", "secure_filename"]
+    description: >
+      A file path constructed from user input may allow directory traversal
+      (e.g. '../../etc/passwd'), granting access to arbitrary files.
+    remediation: >
+      Resolve and canonicalise paths with os.path.realpath(). Reject paths outside the allowed root.
+    references:
+      - "https://owasp.org/www-community/attacks/Path_Traversal"
+      - "https://cwe.mitre.org/data/definitions/22.html"
+
+  - vuln_type: "Insecure Deserialisation"
+    cwe: "CWE-502"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["pickle.loads", "pickle.load", "yaml.load", "marshal.loads"]
+    sink_pattern: '(pickle\.loads?|yaml\.load\s*\(|marshal\.loads?)'
+    sources: ["request", "data", "body", "network", "socket", "recv", "read"]
+    sinks: ["pickle.loads", "pickle.load", "yaml.load", "marshal.loads", "marshal.load"]
+    sanitizers: ["yaml.safe_load", "yaml.safe_load_all"]
+    description: >
+      Deserialising data from an untrusted source can allow arbitrary code execution.
+      pickle, yaml.load, and marshal are unsafe on attacker-controlled input.
+    remediation: >
+      Use pickle only on trusted data. Replace yaml.load with yaml.safe_load. Avoid marshal for external data.
+    references:
+      - "https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data"
+      - "https://cwe.mitre.org/data/definitions/502.html"
+
+  - vuln_type: "Hardcoded Secret"
+    cwe: "CWE-798"
+    severity: MEDIUM
+    node_types: [ASSIGN, LITERAL]
+    keywords: ["password", "secret", "api_key", "token", "passwd", "private_key"]
+    sink_pattern: '(password|secret|api_key|token|passwd|private_key)\s*=\s*["''][^"'']{6,}["'']'
+    sources: []
+    sinks: ["password", "secret", "api_key", "token", "passwd", "private_key"]
+    sanitizers: ["os.environ", "os.getenv", "getenv", "environ.get"]
+    description: >
+      A credential or secret key is hardcoded in source code.
+      Anyone with repository access can extract the secret.
+    remediation: >
+      Load secrets from environment variables or a secrets manager (e.g. HashiCorp Vault, AWS Secrets Manager).
+    references:
+      - "https://cwe.mitre.org/data/definitions/798.html"
+
+  - vuln_type: "Cross-Site Scripting (XSS)"
+    cwe: "CWE-79"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["innerHTML", "dangerouslySetInnerHTML", "document.write", "render_template_string"]
+    sink_pattern: '(innerHTML|dangerouslySetInnerHTML|document\.write|render_template_string)\s*[\(=]'
+    sources: ["request", "args", "form", "params", "user_input", "query"]
+    sinks: ["innerHTML", "dangerouslySetInnerHTML", "document.write", "render_template_string", "Markup"]
+    sanitizers: ["escape", "bleach.clean", "markupsafe.escape", "html.escape", "sanitize"]
+    description: >
+      User-supplied data is injected into the DOM without escaping.
+      An attacker can execute arbitrary JavaScript in a victim's browser.
+    remediation: >
+      Escape all user input before DOM insertion. Use framework-provided safe rendering (React JSX, Jinja2 autoescaping).
+    references:
+      - "https://owasp.org/www-community/attacks/xss/"
+      - "https://cwe.mitre.org/data/definitions/79.html"
+
+  - vuln_type: "Missing Authentication"
+    cwe: "CWE-306"
+    severity: MEDIUM
+    node_types: [FUNCTION, IF]
+    keywords: ["login_required", "authenticate", "is_authenticated", "auth_required"]
+    sink_pattern: '@(app\.route|router\.(get|post|put|delete|patch))'
+    sources: []
+    sinks: ["app.route", "router.get", "router.post", "router.put", "router.delete", "router.patch"]
+    sanitizers: ["login_required", "auth_required", "jwt_required", "require_permission", "is_authenticated"]
+    description: >
+      An endpoint or sensitive function lacks an authentication check.
+      Unauthenticated users may access protected resources.
+    remediation: >
+      Apply @login_required, JWT verification, or equivalent middleware to all protected routes.
+    references:
+      - "https://cwe.mitre.org/data/definitions/306.html"
+
+  - vuln_type: "Unsafe Regex (ReDoS)"
+    cwe: "CWE-1333"
+    severity: LOW
+    node_types: [CALL]
+    keywords: ["re.compile", "re.match", "re.search", "re.fullmatch"]
+    sink_pattern: 're\.(compile|match|search|fullmatch)\s*\('
+    sources: ["request", "args", "form", "params", "user_input"]
+    sinks: ["re.compile", "re.match", "re.search", "re.fullmatch", "re.findall"]
+    sanitizers: []
+    description: >
+      A regular expression with nested quantifiers applied to user input may
+      cause catastrophic backtracking, leading to denial of service.
+    remediation: >
+      Audit complex regexes for catastrophic backtracking. Use timeout parameters or atomic groups.
+    references:
+      - "https://cwe.mitre.org/data/definitions/1333.html"

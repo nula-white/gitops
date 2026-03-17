@@ -1,0 +1,104 @@
+# backend/sinks/javascript.yaml
+# Covers JavaScript and TypeScript (TSX).
+
+patterns:
+
+  - vuln_type: "SQL Injection"
+    cwe: "CWE-89"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["query", "execute", "raw", "knex", "sequelize"]
+    sink_pattern: '\.(query|execute|raw)\s*\('
+    sources: ["req.body", "req.query", "req.params", "request.body", "searchParams", "formData"]
+    sinks: ["query", "execute", "raw", "knex.raw", "sequelize.query"]
+    sanitizers: ["escape", "parameterize", "sanitize", "prepared"]
+    description: >
+      User-controlled data flows into a database query without parameterisation.
+    remediation: >
+      Use parameterised queries with placeholders. Never interpolate user input into SQL strings.
+    references:
+      - "https://owasp.org/www-community/attacks/SQL_Injection"
+      - "https://cwe.mitre.org/data/definitions/89.html"
+
+  - vuln_type: "Command Injection"
+    cwe: "CWE-78"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["exec", "execSync", "spawn", "spawnSync", "shell"]
+    sink_pattern: '(child_process\.)?(exec|execSync|spawn|spawnSync)\s*\('
+    sources: ["req.body", "req.query", "req.params", "process.env", "argv"]
+    sinks: ["exec", "execSync", "spawn", "spawnSync", "execFile"]
+    sanitizers: ["shell-escape", "shellEscape"]
+    description: >
+      Unsanitised input is passed to a shell command.
+    remediation: >
+      Use spawn with an argument array, never exec with a string. Avoid shell: true.
+    references:
+      - "https://cwe.mitre.org/data/definitions/78.html"
+
+  - vuln_type: "Cross-Site Scripting (XSS)"
+    cwe: "CWE-79"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["innerHTML", "dangerouslySetInnerHTML", "document.write", "outerHTML"]
+    sink_pattern: '(innerHTML|outerHTML|document\.write|dangerouslySetInnerHTML)\s*[\(=]'
+    sources: ["req.body", "req.query", "req.params", "location.search", "location.hash"]
+    sinks: ["innerHTML", "outerHTML", "document.write", "dangerouslySetInnerHTML"]
+    sanitizers: ["DOMPurify.sanitize", "sanitizeHtml", "escapeHtml", "textContent"]
+    description: >
+      User-supplied data is injected into the DOM without escaping.
+    remediation: >
+      Use textContent instead of innerHTML. Sanitise with DOMPurify before any HTML insertion.
+    references:
+      - "https://owasp.org/www-community/attacks/xss/"
+      - "https://cwe.mitre.org/data/definitions/79.html"
+
+  - vuln_type: "Path Traversal"
+    cwe: "CWE-22"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["readFile", "readFileSync", "createReadStream", "path.join", "sendFile"]
+    sink_pattern: '(readFile|readFileSync|createReadStream|path\.join|sendFile)\s*\('
+    sources: ["req.body", "req.query", "req.params"]
+    sinks: ["readFile", "readFileSync", "createReadStream", "path.join", "sendFile", "res.sendFile"]
+    sanitizers: ["path.resolve", "path.normalize", "path.basename"]
+    description: >
+      A file path constructed from user input may allow directory traversal.
+    remediation: >
+      Resolve paths with path.resolve() and confirm the result is inside the allowed directory.
+    references:
+      - "https://cwe.mitre.org/data/definitions/22.html"
+
+  - vuln_type: "Hardcoded Secret"
+    cwe: "CWE-798"
+    severity: MEDIUM
+    node_types: [ASSIGN, LITERAL]
+    keywords: ["password", "secret", "apiKey", "token", "privateKey", "api_key"]
+    sink_pattern: '(password|secret|apiKey|api_key|token|privateKey)\s*=\s*["`''][^"`'']{6,}["`'']'
+    sources: []
+    sinks: ["password", "secret", "apiKey", "api_key", "token", "privateKey"]
+    sanitizers: ["process.env", "dotenv", "config()"]
+    description: >
+      A credential or secret key is hardcoded in source code.
+    remediation: >
+      Load secrets from process.env or a secrets manager. Never hardcode credentials.
+    references:
+      - "https://cwe.mitre.org/data/definitions/798.html"
+
+  - vuln_type: "Prototype Pollution"
+    cwe: "CWE-1321"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["merge", "extend", "assign", "__proto__", "constructor"]
+    sink_pattern: '(__proto__|constructor\[.prototype.\]|Object\.assign)\s*[\[\(=]'
+    sources: ["req.body", "req.query", "JSON.parse"]
+    sinks: ["merge", "extend", "assign", "__proto__", "Object.assign"]
+    sanitizers: ["Object.freeze", "Object.create(null)", "hasOwnProperty"]
+    description: >
+      User-controlled keys can overwrite Object.prototype properties,
+      affecting all objects in the application and potentially enabling RCE.
+    remediation: >
+      Validate object keys against an allowlist. Use Object.create(null) for untrusted data.
+      Consider using a safe merge library that blocks __proto__ and constructor keys.
+    references:
+      - "https://cwe.mitre.org/data/definitions/1321.html"

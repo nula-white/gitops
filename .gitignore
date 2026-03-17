@@ -1,0 +1,6 @@
+.env
+vault/data/
+vault/logs/
+vault/vault-keys.txt
+__pycache__/
+*.pyc

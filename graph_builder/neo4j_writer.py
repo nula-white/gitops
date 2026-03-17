@@ -46,52 +46,52 @@ RETRY_BATCH     = 250
 # Cypher queries
 
 _MERGE_NODE_CYPHER = """
-UNWIND $batch AS props
-MERGE (n:CPGNode {node_id: props.node_id})
-ON CREATE SET
-  n.node_type       = props.node_type,
-  n.language        = props.language,
-  n.file_path       = props.file_path,
-  n.start_line      = props.start_line,
-  n.end_line        = props.end_line,
-  n.start_col       = props.start_col,
-  n.end_col         = props.end_col,
-  n.raw_text        = props.raw_text,
-  n.normalized_text = props.normalized_text,
-  n.token_ids       = props.token_ids,
-  n.security_label  = props.security_label,
-  n.cwe_hint        = props.cwe_hint,
-  n.sarif_rule_id   = props.sarif_rule_id,
-  n.risk_score      = props.risk_score,
-  n.is_vulnerable   = props.is_vulnerable,
-  n.confidence      = props.confidence,
-  n.finding_type    = props.finding_type,
-  n.parent_function = props.parent_function,
-  n.parent_class    = props.parent_class,
-  n.is_async        = props.is_async,
-  n.session_id      = props.session_id,
-  n.repo_hash       = props.repo_hash
-ON MATCH SET
-  n.security_label  = props.security_label,
-  n.cwe_hint        = props.cwe_hint,
-  n.sarif_rule_id   = props.sarif_rule_id,
-  n.risk_score      = props.risk_score,
-  n.is_vulnerable   = props.is_vulnerable,
-  n.confidence      = props.confidence,
-  n.finding_type    = props.finding_type
-"""
+        UNWIND $batch AS props
+        MERGE (n:CPGNode {node_id: props.node_id})
+        ON CREATE SET
+        n.node_type       = props.node_type,
+        n.language        = props.language,
+        n.file_path       = props.file_path,
+        n.start_line      = props.start_line,
+        n.end_line        = props.end_line,
+        n.start_col       = props.start_col,
+        n.end_col         = props.end_col,
+        n.raw_text        = props.raw_text,
+        n.normalized_text = props.normalized_text,
+        n.token_ids       = props.token_ids,
+        n.security_label  = props.security_label,
+        n.cwe_hint        = props.cwe_hint,
+        n.sarif_rule_id   = props.sarif_rule_id,
+        n.risk_score      = props.risk_score,
+        n.is_vulnerable   = props.is_vulnerable,
+        n.confidence      = props.confidence,
+        n.finding_type    = props.finding_type,
+        n.parent_function = props.parent_function,
+        n.parent_class    = props.parent_class,
+        n.is_async        = props.is_async,
+        n.session_id      = props.session_id,
+        n.repo_hash       = props.repo_hash
+        ON MATCH SET
+        n.security_label  = props.security_label,
+        n.cwe_hint        = props.cwe_hint,
+        n.sarif_rule_id   = props.sarif_rule_id,
+        n.risk_score      = props.risk_score,
+        n.is_vulnerable   = props.is_vulnerable,
+        n.confidence      = props.confidence,
+        n.finding_type    = props.finding_type
+    """
 
 # Dynamic edge query — edge type is part of the relationship type in Neo4j.
 # We build one query per edge type to use the correct relationship label.
-# (Neo4j does not support dynamic relationship types in MERGE.)
+
 def _edge_cypher(edge_type: str) -> str:
     return f"""
-UNWIND $batch AS props
-MATCH (a:CPGNode {{node_id: props.src_id}})
-MATCH (b:CPGNode {{node_id: props.dst_id}})
-MERGE (a)-[r:{edge_type} {{edge_id: props.edge_id}}]->(b)
-ON CREATE SET r += props
-"""
+        UNWIND $batch AS props
+        MATCH (a:CPGNode {{node_id: props.src_id}})
+        MATCH (b:CPGNode {{node_id: props.dst_id}})
+        MERGE (a)-[r:{edge_type} {{edge_id: props.edge_id}}]->(b)
+        ON CREATE SET r += props
+    """
 
 # Index creation queries (run once at startup)
 _SETUP_QUERIES = [
@@ -120,14 +120,16 @@ class Neo4jWriter:
     Writes CPG nodes and edges to Neo4j.
 
     Usage:
-        writer = Neo4jWriter(uri="bolt://localhost:7687",
+        writer = Neo4jWriter(uri="neo4j://127.0.0.1:7687",
                              user="neo4j", password="password")
         result = writer.write(nodes, edges, session_id, repo_hash)
         writer.close()
 
     When neo4j is unavailable, use MockNeo4jWriter for testing.
     """
-
+    import os
+    from dotenv import load_dotenv
+    password= os.getenv("NEO4J_PASSWORD", "password")
     def __init__(
         self,
         uri:      str = "bolt://localhost:7687",

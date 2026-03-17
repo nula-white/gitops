@@ -1,0 +1,67 @@
+# backend/sinks/go.yaml
+
+patterns:
+
+  - vuln_type: "SQL Injection"
+    cwe: "CWE-89"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["db.Query", "db.Exec", "db.QueryRow", "Raw("]
+    sink_pattern: '\.(Query|Exec|QueryRow|QueryContext|ExecContext)\s*\('
+    sources: ["r.FormValue", "r.URL.Query", "r.PostFormValue", "r.PathValue"]
+    sinks: ["db.Query", "db.Exec", "db.QueryRow", "db.QueryContext", "db.ExecContext", "Raw"]
+    sanitizers: ["db.Prepare", "stmt.Query", "stmt.Exec", "sqlx.NamedExec"]
+    description: >
+      User-controlled data flows into a database query without parameterisation.
+    remediation: >
+      Always use db.Prepare with ? placeholders or named parameters. Never fmt.Sprintf into SQL.
+    references:
+      - "https://cwe.mitre.org/data/definitions/89.html"
+
+  - vuln_type: "Command Injection"
+    cwe: "CWE-78"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["exec.Command", "exec.CommandContext", "os.StartProcess"]
+    sink_pattern: '(exec\.Command|exec\.CommandContext|os\.StartProcess)\s*\('
+    sources: ["r.FormValue", "r.URL.Query", "r.PostFormValue", "os.Args"]
+    sinks: ["exec.Command", "exec.CommandContext", "os.StartProcess"]
+    sanitizers: []
+    description: >
+      Unsanitised input is passed to a subprocess command.
+    remediation: >
+      Pass arguments as separate strings to exec.Command, never construct via fmt.Sprintf.
+    references:
+      - "https://cwe.mitre.org/data/definitions/78.html"
+
+  - vuln_type: "Path Traversal"
+    cwe: "CWE-22"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["os.Open", "os.ReadFile", "ioutil.ReadFile", "filepath.Join"]
+    sink_pattern: '(os\.Open|os\.ReadFile|ioutil\.ReadFile|filepath\.Join)\s*\('
+    sources: ["r.FormValue", "r.URL.Query", "r.URL.Path"]
+    sinks: ["os.Open", "os.ReadFile", "ioutil.ReadFile", "filepath.Join", "os.OpenFile"]
+    sanitizers: ["filepath.Clean", "filepath.Abs", "strings.HasPrefix"]
+    description: >
+      A file path constructed from user input may allow directory traversal.
+    remediation: >
+      Use filepath.Clean and verify the resolved path is within the allowed directory.
+    references:
+      - "https://cwe.mitre.org/data/definitions/22.html"
+
+  - vuln_type: "Hardcoded Secret"
+    cwe: "CWE-798"
+    severity: MEDIUM
+    node_types: [ASSIGN, LITERAL]
+    keywords: ["password", "secret", "apiKey", "token", "privateKey"]
+    sink_pattern: '(password|secret|apiKey|token|privateKey)\s*:?=\s*"[^"]{6,}"'
+    sources: []
+    sinks: ["password", "secret", "apiKey", "token", "privateKey"]
+    sanitizers: ["os.Getenv", "os.LookupEnv", "viper.GetString"]
+    description: >
+      A credential is hardcoded in Go source code.
+    remediation: >
+      Use os.Getenv or a configuration library. Never hardcode credentials in source.
+    references:
+      - "https://cwe.mitre.org/data/definitions/798.html"

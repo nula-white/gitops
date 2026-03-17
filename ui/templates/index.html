@@ -5,161 +5,413 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PRISM — Security Analysis Dashboard</title>
 
-<!-- vis.js for graph rendering (CDN, no build step needed) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
 <link  rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css">
 
 <style>
-/* ── Reset & base ────────────────────────────────────────────────────────── */
+/* ── Reset ───────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --bg:         #0f172a;
-  --surface:    #1e293b;
-  --surface2:   #263148;
-  --border:     #334155;
-  --text:       #e2e8f0;
-  --text-dim:   #94a3b8;
-  --accent:     #3b82f6;
-  --green:      #22c55e;
-  --red:        #ef4444;
-  --amber:      #f59e0b;
-  --purple:     #a78bfa;
-  --font-mono:  'Menlo', 'Consolas', 'Courier New', monospace;
-}
-html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; }
 
-/* ── Layout ───────────────────────────────────────────────────────────────── */
-#app { display: grid; grid-template-rows: 56px 1fr; height: 100vh; }
-#header { display: flex; align-items: center; gap: 12px; padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--border); }
-#header h1 { font-size: 18px; font-weight: 700; letter-spacing: 0.05em; color: var(--accent); }
-#header .tagline { color: var(--text-dim); font-size: 12px; }
-#vault-badge { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
-#vault-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+:root {
+  --bg:          #f8fafc;
+  --surface:     #ffffff;
+  --surface2:    #f1f5f9;
+  --border:      #e2e8f0;
+  --border2:     #cbd5e1;
+  --text:        #0f172a;
+  --text-dim:    #64748b;
+  --text-dimmer: #94a3b8;
+  --accent:      #2563eb;
+  --accent-bg:   #eff6ff;
+  --green:       #16a34a;
+  --green-bg:    #f0fdf4;
+  --red:         #dc2626;
+  --red-bg:      #fef2f2;
+  --amber:       #d97706;
+  --amber-bg:    #fffbeb;
+  --purple:      #7c3aed;
+  --purple-bg:   #f5f3ff;
+  --font-mono:   'Menlo', 'Consolas', 'Courier New', monospace;
+  --radius:      6px;
+  --shadow:      0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── App shell ───────────────────────────────────────────────────────────── */
+#app { display: grid; grid-template-rows: 52px 1fr; height: 100vh; }
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+#header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  z-index: 10;
+}
+#header-brand { display: flex; align-items: baseline; gap: 10px; }
+#header-brand h1 {
+  font-size: 17px; font-weight: 700;
+  letter-spacing: 0.06em; color: var(--accent);
+}
+#header-brand .tagline { color: var(--text-dim); font-size: 12px; }
+
+#vault-badge {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-dim);
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface2);
+}
+#vault-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
 #vault-dot.ok { background: var(--green); }
 
-#main { display: grid; grid-template-columns: 360px 1fr; overflow: hidden; }
+#gvisor-badge {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-dim);
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface2);
+}
+#gvisor-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dimmer); }
+#gvisor-dot.ok { background: var(--green); }
 
-/* ── Left panel ───────────────────────────────────────────────────────────── */
-#left-panel { display: flex; flex-direction: column; border-right: 1px solid var(--border); overflow: hidden; }
+/* ── Main grid ───────────────────────────────────────────────────────────── */
+#main { display: grid; grid-template-columns: 340px 1fr; overflow: hidden; }
 
-#input-section { padding: 16px; border-bottom: 1px solid var(--border); }
-#input-section h2 { font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+/* ── Left panel ──────────────────────────────────────────────────────────── */
+#left-panel {
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
 
-label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; margin-top: 10px; }
+/* Input form */
+#input-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+#input-section h2 {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase;
+  letter-spacing: 0.08em; margin-bottom: 12px;
+}
+label {
+  display: block; font-size: 12px;
+  color: var(--text-dim); margin-bottom: 3px; margin-top: 9px;
+}
 label:first-of-type { margin-top: 0; }
+
 input[type="text"], input[type="password"] {
   width: 100%; padding: 7px 10px;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
   color: var(--text); font-size: 13px; outline: none;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-input:focus { border-color: var(--accent); }
+input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
 
 #analyze-btn {
-  margin-top: 14px; width: 100%; padding: 9px;
-  background: var(--accent); border: none; border-radius: 6px;
-  color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
-  transition: opacity 0.15s;
+  margin-top: 13px; width: 100%; padding: 9px;
+  background: var(--accent);
+  border: none; border-radius: var(--radius);
+  color: #fff; font-size: 14px; font-weight: 600;
+  cursor: pointer; transition: background 0.15s, opacity 0.15s;
 }
-#analyze-btn:hover:not(:disabled) { opacity: 0.85; }
+#analyze-btn:hover:not(:disabled) { background: #1d4ed8; }
 #analyze-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-/* ── Progress bar ─────────────────────────────────────────────────────────── */
-#progress-section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
-.stage-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
-.stage-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+/* Progress */
+#progress-section {
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.stage-row {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 5px; font-size: 12px; color: var(--text-dim);
+}
+.stage-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--border2); flex-shrink: 0;
+}
 .stage-dot.active { background: var(--amber); animation: pulse 1s infinite; }
 .stage-dot.done   { background: var(--green); }
 .stage-dot.error  { background: var(--red); }
-@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
-#progress-bar-wrap { height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px; }
-#progress-bar { height: 100%; background: var(--accent); border-radius: 2px; width: 0%; transition: width 0.4s; }
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
 
-/* ── Log console ──────────────────────────────────────────────────────────── */
+#progress-bar-wrap {
+  height: 3px; background: var(--border);
+  border-radius: 2px; margin-top: 8px;
+}
+#progress-bar {
+  height: 100%; background: var(--accent);
+  border-radius: 2px; width: 0%;
+  transition: width 0.4s;
+}
+
+/* Log console */
 #log-section { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-#log-section h2 { padding: 10px 16px 6px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+#log-section h2 {
+  padding: 9px 16px 5px;
+  font-size: 11px; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
 #log-output {
-  flex: 1; overflow-y: auto; padding: 4px 12px 12px;
-  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+  flex: 1; overflow-y: auto;
+  padding: 6px 12px 12px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.6;
+  background: var(--bg);
 }
 .log-line { margin: 1px 0; }
 .log-line.info    { color: var(--text); }
 .log-line.warning { color: var(--amber); }
 .log-line.error   { color: var(--red); }
-.log-line.debug   { color: var(--text-dim); }
-.log-ts { color: #475569; margin-right: 6px; }
+.log-line.debug   { color: var(--text-dimmer); }
+.log-ts { color: var(--text-dimmer); margin-right: 6px; }
 
-/* ── Right panel ──────────────────────────────────────────────────────────── */
-#right-panel { display: grid; grid-template-rows: 1fr 220px; overflow: hidden; }
-
-/* ── Graph canvas ─────────────────────────────────────────────────────────── */
-#graph-section { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-#graph-toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
-#graph-toolbar h2 { font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
-.btn-sm {
-  padding: 4px 10px; font-size: 12px; border: 1px solid var(--border);
-  background: var(--surface2); color: var(--text); border-radius: 4px; cursor: pointer;
+/* ── Right panel ─────────────────────────────────────────────────────────── */
+#right-panel {
+  display: grid;
+  grid-template-rows: 1fr 280px;
+  overflow: hidden;
+  background: var(--bg);
 }
-.btn-sm:hover { background: var(--border); }
+
+/* Graph section */
+#graph-section { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+
+#graph-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+#graph-toolbar h2 {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em;
+}
+
+#legend { display: flex; gap: 10px; align-items: center; margin-left: 6px; }
+.legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+
 #graph-stats { margin-left: auto; font-size: 11px; color: var(--text-dim); }
 
-#graph-canvas { flex: 1; background: var(--bg); position: relative; }
+.btn-sm {
+  padding: 4px 9px; font-size: 11px;
+  border: 1px solid var(--border2);
+  background: var(--surface2); color: var(--text-dim);
+  border-radius: var(--radius); cursor: pointer;
+  transition: background 0.12s;
+}
+.btn-sm:hover { background: var(--border); color: var(--text); }
+
+#graph-canvas {
+  flex: 1;
+  background: var(--bg);
+  position: relative;
+}
 #graph-canvas .vis-network { background: var(--bg) !important; }
-#graph-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-dim); gap: 8px; }
-#graph-empty svg { opacity: 0.3; }
 
-/* Legend */
-#legend { display: flex; gap: 14px; padding: 0 14px; align-items: center; }
-.legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+#graph-empty {
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  height: 100%; color: var(--text-dimmer); gap: 8px;
+}
+#graph-empty svg { opacity: 0.25; }
 
-/* Node tooltip panel */
+/* ── Node info panel ─────────────────────────────────────────────────────── */
 #node-info {
   position: absolute; right: 10px; top: 10px;
-  width: 240px; background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; padding: 12px; font-size: 12px; display: none;
-  z-index: 10; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  width: 230px;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 8px; padding: 12px;
+  font-size: 12px; display: none; z-index: 10;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.10);
 }
 #node-info h3 { font-size: 13px; margin-bottom: 8px; color: var(--accent); }
 .ni-row { display: flex; justify-content: space-between; margin: 3px 0; }
 .ni-label { color: var(--text-dim); }
-.ni-value { font-family: var(--font-mono); color: var(--text); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-.badge-SINK      { background: #7f1d1d; color: #fca5a5; }
-.badge-SOURCE    { background: #1e3a5f; color: #93c5fd; }
-.badge-SANITIZER { background: #14532d; color: #86efac; }
-.badge-SENSITIVE { background: #78350f; color: #fcd34d; }
-.badge-NONE      { background: #1e293b; color: #94a3b8; }
-
-/* ── Findings panel ───────────────────────────────────────────────────────── */
-#findings-section { border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
-#findings-section h2 { padding: 8px 14px 4px; font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; flex-shrink: 0; }
-#findings-list { flex: 1; overflow-y: auto; padding: 0 12px 10px; }
-.finding-card {
-  margin: 6px 0; padding: 10px 12px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
-  cursor: pointer; transition: border-color 0.15s;
-  display: grid; grid-template-columns: 1fr auto; gap: 4px;
+.ni-value {
+  font-family: var(--font-mono); color: var(--text);
+  max-width: 130px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
 }
-.finding-card:hover { border-color: var(--accent); }
-.finding-card.highlight { border-color: var(--accent); background: var(--surface2); }
-.finding-name { font-weight: 600; font-size: 13px; }
-.finding-loc { color: var(--text-dim); font-size: 11px; font-family: var(--font-mono); }
-.finding-cwe { font-size: 11px; color: var(--purple); margin-top: 2px; }
-.finding-snippet { font-size: 11px; font-family: var(--font-mono); color: var(--text-dim); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1/-1; }
-.conf-bar { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-dim); }
-.conf-fill { height: 4px; border-radius: 2px; }
-.findings-empty { color: var(--text-dim); text-align: center; padding: 20px; font-size: 12px; }
+#ni-snippet {
+  margin-top: 8px; font-size: 11px;
+  font-family: var(--font-mono); color: var(--text-dim);
+  word-break: break-all; line-height: 1.5;
+}
+
+/* Label badges */
+.badge { padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-SINK      { background: #fee2e2; color: #991b1b; }
+.badge-SOURCE    { background: #dbeafe; color: #1e40af; }
+.badge-SANITIZER { background: #dcfce7; color: #166534; }
+.badge-SENSITIVE { background: #fef3c7; color: #92400e; }
+.badge-NONE      { background: var(--surface2); color: var(--text-dim); }
+
+/* Severity badges */
+.sev-HIGH   { background: #fee2e2; color: #991b1b; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+.sev-MEDIUM { background: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+.sev-LOW    { background: #dcfce7; color: #166534; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+.sev-INFO   { background: #dbeafe; color: #1e40af; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+
+/* ── Findings panel ──────────────────────────────────────────────────────── */
+#findings-section {
+  border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--surface);
+}
+#findings-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px 4px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+#findings-header h2 {
+  font-size: 11px; font-weight: 600;
+  color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em;
+}
+#findings-count { color: var(--red); font-size: 11px; font-weight: 500; }
+#findings-list { flex: 1; overflow-y: auto; padding: 6px 10px 10px; }
+
+/* ── Finding card ────────────────────────────────────────────────────────── */
+.finding-card {
+  margin: 5px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.finding-card:hover { border-color: var(--accent); box-shadow: 0 1px 4px rgba(37,99,235,0.10); }
+.finding-card.highlight { border-color: var(--accent); background: var(--accent-bg); }
+.finding-card.expanded .finding-body { display: block; }
+
+/* Card header row */
+.finding-head {
+  display: flex; align-items: flex-start;
+  justify-content: space-between;
+  padding: 8px 10px 6px;
+  gap: 8px;
+}
+.finding-head-left { flex: 1; min-width: 0; }
+.finding-title {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 600; font-size: 13px;
+  margin-bottom: 2px;
+}
+.finding-loc {
+  font-size: 11px; color: var(--text-dim);
+  font-family: var(--font-mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.finding-cwe {
+  font-size: 11px; color: var(--purple);
+  margin-top: 1px; font-weight: 500;
+}
+.finding-conf {
+  display: flex; flex-direction: column;
+  align-items: flex-end; gap: 3px;
+  font-size: 11px; color: var(--text-dim);
+  flex-shrink: 0;
+}
+.conf-bar-wrap { width: 44px; height: 3px; background: var(--border); border-radius: 2px; }
+.conf-bar-fill { height: 100%; border-radius: 2px; }
+
+/* Card body (expanded) */
+.finding-body { display: none; border-top: 1px solid var(--border); padding: 0; }
+
+.finding-section {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.finding-section:last-child { border-bottom: none; }
+.fsec-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.07em;
+  color: var(--text-dimmer); text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.fsec-value {
+  font-size: 12px; color: var(--text);
+  line-height: 1.55;
+}
+.fsec-value.mono { font-family: var(--font-mono); font-size: 11px; }
+
+/* Code snippet block */
+.code-snippet {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: pre;
+  overflow-x: auto;
+  line-height: 1.6;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+/* References */
+.finding-refs a {
+  display: block;
+  font-size: 11px; color: var(--accent);
+  text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-bottom: 2px;
+}
+.finding-refs a:hover { text-decoration: underline; }
+
+.findings-empty {
+  color: var(--text-dimmer); text-align: center;
+  padding: 20px; font-size: 12px;
+}
+
+/* ── Scrollbars ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dimmer); }
 </style>
 </head>
 <body>
 <div id="app">
 
-  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <!-- Header -->
   <header id="header">
-    <div style="display:flex;flex-direction:column;">
+    <div id="header-brand">
       <h1>PRISM</h1>
       <span class="tagline">Zero-Trust Code Analysis Platform</span>
+    </div>
+    <div id="gvisor-badge">
+      <div id="gvisor-dot"></div>
+      <span id="gvisor-status">gVisor: checking…</span>
     </div>
     <div id="vault-badge">
       <div id="vault-dot"></div>
@@ -169,42 +421,42 @@ input:focus { border-color: var(--accent); }
 
   <div id="main">
 
-    <!-- ── Left panel ───────────────────────────────────────────────────── -->
+    <!-- Left panel -->
     <aside id="left-panel">
 
-      <!-- Input form -->
       <section id="input-section">
         <h2>Repository Analysis</h2>
 
         <label for="repo-url">GitHub Repository URL</label>
-        <input type="text" id="repo-url" placeholder="https://github.com/owner/repo" value="">
+        <input type="text" id="repo-url" placeholder="https://github.com/owner/repo">
 
         <label for="branch">Branch</label>
-        <input type="text" id="branch" placeholder="main" value="main">
+        <input type="text" id="branch" value="main" placeholder="main">
 
-        <label for="commit-sha">Commit SHA <span style="color:#475569">(optional — pins to exact commit)</span></label>
+        <label for="commit-sha">
+          Commit SHA <span style="color:var(--text-dimmer);font-weight:400">(optional — pins to exact commit)</span>
+        </label>
         <input type="text" id="commit-sha" placeholder="Leave blank to use branch HEAD">
 
         <label for="github-token">GitHub Personal Access Token</label>
-        <input type="password" id="github-token" placeholder="ghp_…  (stored in memory only, never logged)">
+        <input type="password" id="github-token" placeholder="ghp_…  (held in memory only, never logged)">
 
-        <button id="analyze-btn" onclick="startAnalysis()">▶  Analyze Repository</button>
+        <button id="analyze-btn" onclick="startAnalysis()">▶  Analyse Repository</button>
       </section>
 
-      <!-- Stage progress -->
       <section id="progress-section">
         <div id="stages">
           <div class="stage-row"><div class="stage-dot" id="dot-init"></div><span>Initialisation</span></div>
           <div class="stage-row"><div class="stage-dot" id="dot-credential"></div><span>Credential acquisition</span></div>
           <div class="stage-row"><div class="stage-dot" id="dot-ingestion"></div><span>Repository ingestion + integrity</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-sandbox"></div><span>gVisor sandbox isolation</span></div>
           <div class="stage-row"><div class="stage-dot" id="dot-parsing"></div><span>CPG construction (Joern · Tree-sitter)</span></div>
-          <div class="stage-row"><div class="stage-dot" id="dot-graph"></div><span>Security analysis + SARIF injection</span></div>
+          <div class="stage-row"><div class="stage-dot" id="dot-graph"></div><span>Vulnerability analysis + SARIF</span></div>
           <div class="stage-row"><div class="stage-dot" id="dot-done"></div><span>Complete</span></div>
         </div>
         <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
       </section>
 
-      <!-- Log console -->
       <section id="log-section">
         <h2>Pipeline Log</h2>
         <div id="log-output"></div>
@@ -212,39 +464,41 @@ input:focus { border-color: var(--accent); }
 
     </aside>
 
-    <!-- ── Right panel ──────────────────────────────────────────────────── -->
+    <!-- Right panel -->
     <main id="right-panel">
 
-      <!-- Graph area -->
+      <!-- Graph -->
       <section id="graph-section">
         <div id="graph-toolbar">
           <h2>Code Property Graph</h2>
           <div id="legend">
-            <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>SINK</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>SOURCE</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>SANITIZER</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>SENSITIVE</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>OTHER</div>
-            <div class="legend-item"><div style="width:20px;height:2px;background:#fb923c"></div>DFG</div>
-            <div class="legend-item"><div style="width:20px;height:2px;background:#60a5fa;border-top: 2px dashed #60a5fa;margin-top:-2px"></div>CFG</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#dc2626"></div>SINK</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#2563eb"></div>SOURCE</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#16a34a"></div>SANITIZER</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#d97706"></div>SENSITIVE</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#64748b"></div>OTHER</div>
+            <div class="legend-item"><div style="width:18px;height:2px;background:#fb923c;border-radius:1px"></div>DFG</div>
+            <div class="legend-item"><div style="width:18px;border-top:2px dashed #60a5fa"></div>CFG</div>
           </div>
-          <div id="graph-stats" style="margin-left:auto"></div>
+          <div id="graph-stats"></div>
           <button class="btn-sm" onclick="fitGraph()">Fit</button>
           <button class="btn-sm" onclick="togglePhysics()">Physics</button>
           <button class="btn-sm" onclick="filterSinks()">Sinks only</button>
           <button class="btn-sm" onclick="resetFilter()">Show all</button>
         </div>
-        <div id="graph-canvas" style="position:relative;flex:1;">
+
+        <div id="graph-canvas">
           <div id="graph-empty">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/>
-              <circle cx="12" cy="19" r="2"/>
+            <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="12" cy="19" r="2"/>
               <line x1="7" y1="5" x2="17" y2="5"/>
               <line x1="5.7" y1="7" x2="11" y2="17"/>
               <line x1="18.3" y1="7" x2="13" y2="17"/>
             </svg>
-            <span>Run an analysis to see the Code Property Graph</span>
+            <span style="font-size:13px">Run an analysis to see the Code Property Graph</span>
           </div>
+
+          <!-- Node detail panel -->
           <div id="node-info">
             <h3 id="ni-name">—</h3>
             <div class="ni-row"><span class="ni-label">Type</span><span class="ni-value" id="ni-type"></span></div>
@@ -253,14 +507,18 @@ input:focus { border-color: var(--accent); }
             <div class="ni-row"><span class="ni-label">Line</span><span class="ni-value" id="ni-line"></span></div>
             <div class="ni-row"><span class="ni-label">CWE</span><span class="ni-value" id="ni-cwe"></span></div>
             <div class="ni-row"><span class="ni-label">Backend</span><span class="ni-value" id="ni-backend"></span></div>
-            <div style="margin-top:8px;font-size:11px;color:var(--text-dim);font-family:var(--font-mono);word-break:break-all" id="ni-snippet"></div>
+            <div id="ni-snippet"></div>
           </div>
         </div>
       </section>
 
-      <!-- Findings panel -->
+      <!-- Findings -->
       <section id="findings-section">
-        <h2>Vulnerability Findings <span id="findings-count" style="color:var(--red);font-size:11px;font-weight:400"></span></h2>
+        <div id="findings-header">
+          <h2>Vulnerability Findings</h2>
+          <span id="findings-count"></span>
+          <span style="margin-left:auto;font-size:11px;color:var(--text-dimmer)">Click a card to expand · click graph node to focus</span>
+        </div>
         <div id="findings-list">
           <div class="findings-empty">No findings yet — run an analysis.</div>
         </div>
@@ -272,38 +530,50 @@ input:focus { border-color: var(--accent); }
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
-let network       = null;
-let allNodes      = null;
-let allEdges      = null;
+let network        = null;
+let allNodes       = null;
+let allEdges       = null;
 let currentSession = null;
 let physicsOn      = true;
+let ws             = null;
 
-// ── Vault status ──────────────────────────────────────────────────────────
-async function checkVault() {
+// ── Status badges ─────────────────────────────────────────────────────────
+async function checkStatus() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
-    const dot  = document.getElementById('vault-dot');
-    const span = document.getElementById('vault-status');
+
+    const vDot  = document.getElementById('vault-dot');
+    const vSpan = document.getElementById('vault-status');
     if (d.vault_connected) {
-      dot.classList.add('ok');
-      span.textContent = `Vault: connected (${d.vault_addr})`;
+      vDot.classList.add('ok');
+      vSpan.textContent = `Vault: connected`;
     } else {
-      span.textContent = `Vault: offline (env fallback active)`;
+      vSpan.textContent = `Vault: env fallback`;
+    }
+
+    const gDot  = document.getElementById('gvisor-dot');
+    const gSpan = document.getElementById('gvisor-status');
+    if (d.gvisor_available) {
+      gDot.classList.add('ok');
+      gSpan.textContent = 'gVisor: active (runsc)';
+    } else {
+      gSpan.textContent = 'gVisor: not detected';
     }
   } catch(e) {}
 }
-checkVault();
-setInterval(checkVault, 30000);
+checkStatus();
+setInterval(checkStatus, 30000);
 
 // ── Start analysis ────────────────────────────────────────────────────────
 async function startAnalysis() {
-  const repoUrl    = document.getElementById('repo-url').value.trim();
-  const branch     = document.getElementById('branch').value.trim() || 'main';
-  const commitSha  = document.getElementById('commit-sha').value.trim() || null;
-  const token      = document.getElementById('github-token').value;
+  const repoUrl   = document.getElementById('repo-url').value.trim();
+  const branch    = document.getElementById('branch').value.trim() || 'main';
+  const commitSha = document.getElementById('commit-sha').value.trim() || null;
+  const token     = document.getElementById('github-token').value;
 
-  if (!repoUrl) { appendLog('⚠️ Enter a repository URL first', 'warning'); return; }
+  if (!repoUrl) { appendLog('⚠️  Enter a repository URL first', 'warning'); return; }
+  if (!repoUrl.startsWith('https://')) { appendLog('⚠️  Only HTTPS URLs are accepted', 'warning'); return; }
 
   clearUI();
   document.getElementById('analyze-btn').disabled = true;
@@ -316,8 +586,13 @@ async function startAnalysis() {
     });
     const d = await r.json();
     if (!r.ok) { appendLog(`❌ ${d.error || 'Request failed'}`, 'error'); enableBtn(); return; }
+
     currentSession = d.session_id;
     appendLog(`Session: ${currentSession}`, 'debug');
+
+    // Open WebSocket for real-time graph streaming
+    connectWebSocket(d.ws_url);
+    // Open SSE for log + progress
     connectSSE(currentSession);
   } catch(e) {
     appendLog(`❌ ${e.message}`, 'error');
@@ -325,7 +600,122 @@ async function startAnalysis() {
   }
 }
 
-// ── SSE connection ────────────────────────────────────────────────────────
+// ── WebSocket — real-time node/edge streaming ─────────────────────────────
+function connectWebSocket(wsPath) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url   = `${proto}//${location.host}${wsPath}`;
+
+  if (ws) { try { ws.close(); } catch(e) {} }
+  ws = new WebSocket(url);
+
+  ws.onmessage = (ev) => {
+    const evt = JSON.parse(ev.data);
+    handleWsEvent(evt);
+  };
+  ws.onerror = () => appendLog('WebSocket error', 'debug');
+  ws.onclose = () => appendLog('Graph stream closed', 'debug');
+}
+
+function handleWsEvent(evt) {
+  switch(evt.type) {
+
+    case 'phase':
+      // phase transitions are reflected in stage dots via SSE
+      break;
+
+    case 'node':
+      addNodeLive(evt.payload);
+      break;
+
+    case 'edge':
+      addEdgeLive(evt.payload);
+      break;
+
+    case 'annotation':
+      annotateNodeLive(evt.payload);
+      break;
+
+    case 'finding':
+      appendFindingCard(evt.payload);
+      break;
+
+    case 'complete':
+      const s = evt.payload || {};
+      document.getElementById('graph-stats').textContent =
+        `${s.node_count||0} nodes · ${s.edge_count||0} edges`;
+      break;
+
+    case 'error':
+      appendLog(`❌ ${evt.payload?.message || 'Stream error'}`, 'error');
+      break;
+
+    case 'heartbeat':
+      break;
+  }
+}
+
+// ── Live graph mutation ────────────────────────────────────────────────────
+function ensureNetwork() {
+  if (network) return;
+  document.getElementById('graph-empty').style.display = 'none';
+
+  allNodes = new vis.DataSet([]);
+  allEdges = new vis.DataSet([]);
+
+  const container = document.getElementById('graph-canvas');
+  const options   = buildVisOptions();
+  network = new vis.Network(container, { nodes: allNodes, edges: allEdges }, options);
+
+  network.on('selectNode', (params) => {
+    if (!params.nodes.length) return;
+    showNodeInfo(allNodes.get(params.nodes[0]));
+  });
+  network.on('deselectNode', () => {
+    document.getElementById('node-info').style.display = 'none';
+  });
+}
+
+function addNodeLive(node) {
+  ensureNetwork();
+  try {
+    if (!allNodes.get(node.id)) allNodes.add(node);
+  } catch(e) {}
+  updateGraphStats();
+}
+
+function addEdgeLive(edge) {
+  ensureNetwork();
+  try {
+    if (!allEdges.get(edge.id)) allEdges.add(edge);
+  } catch(e) {}
+  updateGraphStats();
+}
+
+function annotateNodeLive(a) {
+  if (!allNodes || !a.node_id) return;
+  const n = allNodes.get(a.node_id);
+  if (!n) return;
+  const sevColour = {
+    HIGH:   { bg: '#ef4444', border: '#b91c1c' },
+    MEDIUM: { bg: '#f59e0b', border: '#b45309' },
+    LOW:    { bg: '#22c55e', border: '#15803d' },
+  }[a.severity] || null;
+  if (sevColour) {
+    allNodes.update({
+      id: a.node_id,
+      color: { background: sevColour.bg, border: sevColour.border },
+      shape: 'diamond', size: 14,
+    });
+  }
+}
+
+function updateGraphStats() {
+  const nc = allNodes ? allNodes.length : 0;
+  const ec = allEdges ? allEdges.length : 0;
+  document.getElementById('graph-stats').textContent = `${nc} nodes · ${ec} edges`;
+}
+
+// ── SSE — logs + progress ─────────────────────────────────────────────────
 function connectSSE(sessionId) {
   const es = new EventSource(`/api/session/${sessionId}/events`);
 
@@ -340,15 +730,14 @@ function connectSSE(sessionId) {
       document.getElementById('progress-bar').style.width = data.pct + '%';
       if (data.stage) advanceStage(data.stage, 'active');
     }
-    else if (data.type === 'heartbeat') {
-      // no-op, keeps connection alive
-    }
     else if (data.type === 'final') {
       if (data.status === 'complete') {
         markAllDone();
         document.getElementById('progress-bar').style.width = '100%';
-        renderGraph(data.graph);
-        renderFindings(data.findings || []);
+        if (data.summary) {
+          document.getElementById('graph-stats').textContent =
+            `${data.summary.node_count||0} nodes · ${data.summary.edge_count||0} edges`;
+        }
       } else {
         appendLog(`❌ ${data.error || 'Analysis failed'}`, 'error');
         markError();
@@ -358,69 +747,180 @@ function connectSSE(sessionId) {
     }
   };
 
-  es.onerror = () => {
-    appendLog('Connection closed', 'debug');
-    es.close();
-    enableBtn();
-  };
+  es.onerror = () => { es.close(); enableBtn(); };
 }
 
-// ── Stage dots ─────────────────────────────────────────────────────────────
+// ── Stage dots ────────────────────────────────────────────────────────────
 const stageMap = {
-  init: 'dot-init', credential: 'dot-credential', ingestion: 'dot-ingestion',
-  parsing: 'dot-parsing', graph: 'dot-graph', done: 'dot-done',
+  init:'dot-init', credential:'dot-credential', ingestion:'dot-ingestion',
+  sandbox:'dot-sandbox', parsing:'dot-parsing', graph:'dot-graph', done:'dot-done',
 };
 let activeDot = null;
 
 function advanceStage(stage, state) {
-  const id = stageMap[stage];
-  if (!id) return;
-  if (activeDot && activeDot !== id) {
+  const id = stageMap[stage]; if (!id) return;
+  if (activeDot && activeDot !== id)
     document.getElementById(activeDot).className = 'stage-dot done';
-  }
   const dot = document.getElementById(id);
   if (state === 'error') { dot.className = 'stage-dot error'; return; }
   dot.className = 'stage-dot active';
   activeDot = id;
 }
-
 function markAllDone() {
-  Object.values(stageMap).forEach(id => {
-    document.getElementById(id).className = 'stage-dot done';
-  });
+  Object.values(stageMap).forEach(id => document.getElementById(id).className = 'stage-dot done');
   activeDot = null;
 }
-
 function markError() {
   if (activeDot) document.getElementById(activeDot).className = 'stage-dot error';
 }
 
-// ── Log output ─────────────────────────────────────────────────────────────
-function appendLog(msg, level = 'info', stage = '') {
-  const out   = document.getElementById('log-output');
-  const div   = document.createElement('div');
+// ── Log ───────────────────────────────────────────────────────────────────
+function appendLog(msg, level='info') {
+  const out = document.getElementById('log-output');
+  const div = document.createElement('div');
   div.className = `log-line ${level}`;
-  const ts    = new Date().toLocaleTimeString('en-GB', {hour12:false});
+  const ts = new Date().toLocaleTimeString('en-GB',{hour12:false});
   div.innerHTML = `<span class="log-ts">${ts}</span>${escHtml(msg)}`;
   out.appendChild(div);
   out.scrollTop = out.scrollHeight;
 }
 
-// ── Graph rendering ────────────────────────────────────────────────────────
-function renderGraph(graphData) {
-  if (!graphData || !graphData.nodes) return;
+// ── Findings panel ────────────────────────────────────────────────────────
+let findingCount = 0;
 
-  document.getElementById('graph-empty').style.display = 'none';
+function appendFindingCard(f) {
+  const list = document.getElementById('findings-list');
 
-  const visNodes = new vis.DataSet(graphData.nodes);
-  const visEdges = new vis.DataSet(graphData.edges);
-  allNodes = visNodes;
-  allEdges = visEdges;
+  // Remove empty state placeholder
+  const empty = list.querySelector('.findings-empty');
+  if (empty) empty.remove();
 
-  const container = document.getElementById('graph-canvas');
-  const options = {
+  findingCount++;
+  document.getElementById('findings-count').textContent = `— ${findingCount} finding${findingCount!==1?'s':''}`;
+
+  const card = document.createElement('div');
+  card.className = 'finding-card';
+  card.dataset.nodeId = f.node_id;
+
+  const confPct   = Math.round((f.confidence||0)*100);
+  const confColor = confPct>=80 ? '#dc2626' : confPct>=50 ? '#d97706' : '#64748b';
+  const cweTxt    = (f.cwe_hints||[]).join(' · ');
+  const sevClass  = `sev-${(f.severity||'INFO').toUpperCase()}`;
+  const ruleTxt   = f.rule_id ? ` · ${f.rule_id}` : '';
+
+  card.innerHTML = `
+    <div class="finding-head">
+      <div class="finding-head-left">
+        <div class="finding-title">
+          <span class="${sevClass}">${escHtml(f.severity||'INFO')}</span>
+          <span>${escHtml(f.name || (f.node_id||'').slice(0,12))}</span>
+          <span style="margin-left:auto;font-size:11px;color:var(--text-dimmer)">${confPct}% conf.</span>
+        </div>
+        <div class="finding-loc">${escHtml((f.cwe_hints||[]).join(' ') || '')}  ${escHtml((f.file_path||'').split('/').pop())}:${f.start_line}${escHtml(ruleTxt)}</div>
+      </div>
+      <div style="width:10px;text-align:center;color:var(--text-dimmer);font-size:12px;flex-shrink:0;margin-left:4px">▼</div>
+    </div>
+    <div class="finding-body">
+
+      ${f.function_name ? `
+      <div class="finding-section">
+        <div class="fsec-label">Function</div>
+        <div class="fsec-value mono">${escHtml(f.function_name)}()</div>
+      </div>` : ''}
+
+      ${f.description ? `
+      <div class="finding-section">
+        <div class="fsec-label">Description</div>
+        <div class="fsec-value">${escHtml(f.description)}</div>
+      </div>` : ''}
+
+      ${f.raw_text ? `
+      <div class="finding-section">
+        <div class="fsec-label">Code Snippet — line ${f.start_line}</div>
+        <pre class="code-snippet">${escHtml(f.raw_text)}</pre>
+      </div>` : `
+      <div class="finding-section">
+        <div class="fsec-label">Location</div>
+        <div class="fsec-value mono">${escHtml(f.file_path||'')}:${f.start_line}</div>
+      </div>`}
+
+      ${f.remediation ? `
+      <div class="finding-section">
+        <div class="fsec-label">Remediation</div>
+        <div class="fsec-value">${escHtml(f.remediation)}</div>
+      </div>` : ''}
+
+      ${(f.references||[]).length ? `
+      <div class="finding-section">
+        <div class="fsec-label">References</div>
+        <div class="finding-refs">
+          ${(f.references||[]).map(r=>`<a href="${escHtml(r)}" target="_blank" rel="noreferrer">${escHtml(r)}</a>`).join('')}
+        </div>
+      </div>` : ''}
+    </div>`;
+
+  // Toggle expand on click
+  card.addEventListener('click', (e) => {
+    const expanded = card.classList.toggle('expanded');
+    card.querySelector('[style*="▼"]').textContent = expanded ? '▲' : '▼';
+    // Highlight + focus in graph
+    document.querySelectorAll('.finding-card').forEach(c => c.classList.remove('highlight'));
+    card.classList.add('highlight');
+    if (network && f.node_id) {
+      network.selectNodes([f.node_id]);
+      network.focus(f.node_id, { scale: 1.4, animation: true });
+      const n = allNodes && allNodes.get(f.node_id);
+      if (n) showNodeInfo(n);
+    }
+  });
+
+  list.appendChild(card);
+}
+
+// ── Node info panel ───────────────────────────────────────────────────────
+function showNodeInfo(node) {
+  if (!node || !node.meta) return;
+  const m = node.meta;
+  document.getElementById('ni-name').textContent = node.label?.split('\n')[0] || node.id?.slice(0,16);
+  document.getElementById('ni-type').textContent    = m.node_type || '—';
+  document.getElementById('ni-file').textContent    = (m.file_path||'').split('/').pop() || '—';
+  document.getElementById('ni-line').textContent    = m.start_line ?? '—';
+  document.getElementById('ni-cwe').textContent     = (m.cwe_hints||[]).join(', ') || '—';
+  document.getElementById('ni-backend').textContent = m.backend || '—';
+  document.getElementById('ni-snippet').textContent = m.raw_text || '';
+  const lbl = m.security_label || 'NONE';
+  document.getElementById('ni-label-badge').innerHTML = `<span class="badge badge-${lbl}">${lbl}</span>`;
+  document.getElementById('node-info').style.display = 'block';
+}
+
+// ── Graph controls ────────────────────────────────────────────────────────
+function fitGraph()      { if (network) network.fit({ animation: true }); }
+function togglePhysics() {
+  physicsOn = !physicsOn;
+  if (network) network.setOptions({ physics: { enabled: physicsOn } });
+}
+function filterSinks() {
+  if (!allNodes || !allEdges) return;
+  const sinkIds = allNodes.getIds().filter(id => {
+    const n = allNodes.get(id);
+    return n?.meta?.security_label === 'SINK';
+  });
+  if (!sinkIds.length) return;
+  const connected = new Set(sinkIds);
+  allEdges.getIds().forEach(eid => {
+    const e = allEdges.get(eid);
+    if (e && (e.label==='DFG_FLOW'||e.label==='TAINT_SINK') && sinkIds.includes(e.to))
+      connected.add(e.from);
+  });
+  network.selectNodes([...connected]);
+  if ([...connected][0]) network.focus([...connected][0], {scale:1.2,animation:true});
+}
+function resetFilter() { if (network) { network.unselectAll(); network.fit({animation:true}); } }
+
+function buildVisOptions() {
+  return {
     nodes: {
-      font: { color: '#e2e8f0', size: 11 },
+      font: { color: '#1e293b', size: 11 },
       borderWidth: 1.5,
     },
     edges: {
@@ -434,142 +934,13 @@ function renderGraph(graphData) {
       barnesHut: { gravitationalConstant: -3000, springLength: 120 },
     },
     interaction: {
-      hover: true,
-      tooltipDelay: 100,
-      hideEdgesOnDrag: true,
+      hover: true, tooltipDelay: 100, hideEdgesOnDrag: true,
     },
     layout: { improvedLayout: true },
   };
-
-  if (network) { network.destroy(); network = null; }
-  network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
-
-  network.on('selectNode', (params) => {
-    if (params.nodes.length === 0) return;
-    const node = visNodes.get(params.nodes[0]);
-    showNodeInfo(node);
-  });
-  network.on('deselectNode', () => { document.getElementById('node-info').style.display = 'none'; });
-
-  const s = graphData.summary || {};
-  document.getElementById('graph-stats').textContent =
-    `${s.node_count || 0} nodes · ${s.edge_count || 0} edges${s.truncated ? ' (truncated)' : ''}`;
-
-  // Log backend breakdown
-  if (s.backend_counts) {
-    const bc = Object.entries(s.backend_counts).map(([k,v]) => `${k}:${v}`).join('  ');
-    appendLog(`  Graph backends: ${bc}`, 'debug');
-  }
-  if (s.cwe_counts) {
-    const cc = Object.entries(s.cwe_counts).map(([k,v]) => `${k}×${v}`).join('  ');
-    if (cc) appendLog(`  CWEs detected: ${cc}`, 'info');
-  }
 }
 
-function showNodeInfo(node) {
-  if (!node || !node.meta) return;
-  const m = node.meta;
-  document.getElementById('ni-name').textContent = m.file_path
-    ? `${node.label.split('\n')[0] || node.id.slice(0,12)}`
-    : node.id.slice(0,16);
-  document.getElementById('ni-type').textContent    = m.node_type || '—';
-  document.getElementById('ni-file').textContent    = (m.file_path || '').split('/').pop() || '—';
-  document.getElementById('ni-line').textContent    = m.start_line ?? '—';
-  document.getElementById('ni-cwe').textContent     = (m.cwe_hints || []).join(', ') || '—';
-  document.getElementById('ni-backend').textContent = m.backend || '—';
-  document.getElementById('ni-snippet').textContent = m.raw_text || '';
-  const lbl  = m.security_label || 'NONE';
-  document.getElementById('ni-label-badge').innerHTML =
-    `<span class="badge badge-${lbl}">${lbl}</span>`;
-  document.getElementById('node-info').style.display = 'block';
-}
-
-function fitGraph() { if (network) network.fit({ animation: true }); }
-
-function togglePhysics() {
-  physicsOn = !physicsOn;
-  if (network) network.setOptions({ physics: { enabled: physicsOn } });
-}
-
-function filterSinks() {
-  if (!allNodes || !allEdges) return;
-  const sinkIds = allNodes.getIds().filter(id => {
-    const n = allNodes.get(id);
-    return n && n.meta && n.meta.security_label === 'SINK';
-  });
-  if (sinkIds.length === 0) return;
-
-  // Also include nodes connected to sinks via DFG edges
-  const connected = new Set(sinkIds);
-  allEdges.getIds().forEach(eid => {
-    const e = allEdges.get(eid);
-    if (e && (e.label === 'DFG_FLOW' || e.label === 'TAINT_SINK') && sinkIds.includes(e.to)) {
-      connected.add(e.from);
-    }
-  });
-  if (network) network.selectNodes([...connected]);
-  network.focus([...connected][0], { scale: 1.2, animation: true });
-}
-
-function resetFilter() { if (network) { network.unselectAll(); network.fit({ animation: true }); } }
-
-// ── Findings panel ─────────────────────────────────────────────────────────
-function renderFindings(findings) {
-  const list = document.getElementById('findings-list');
-  const cnt  = document.getElementById('findings-count');
-  list.innerHTML = '';
-
-  if (!findings || findings.length === 0) {
-    list.innerHTML = '<div class="findings-empty">No findings detected.</div>';
-    cnt.textContent = '';
-    return;
-  }
-
-  cnt.textContent = `— ${findings.length} finding${findings.length !== 1 ? 's' : ''}`;
-
-  findings.forEach(f => {
-    const card = document.createElement('div');
-    card.className = 'finding-card';
-    card.dataset.nodeId = f.node_id;
-
-    const confPct  = Math.round((f.confidence || 0) * 100);
-    const confColor = confPct >= 80 ? '#ef4444' : confPct >= 50 ? '#f59e0b' : '#6b7280';
-    const cweTxt   = (f.cwe_hints || []).join(' · ') || '';
-    const ruleTxt  = f.rule_id ? `  ·  ${f.rule_id}` : '';
-
-    card.innerHTML = `
-      <div>
-        <div class="finding-name">
-          <span class="badge badge-${f.label}">${f.label}</span>
-          &nbsp;${escHtml(f.name || f.node_id.slice(0,12))}
-        </div>
-        <div class="finding-loc">${escHtml((f.file_path||'').split('/').pop())}:${f.start_line}${ruleTxt}</div>
-        ${cweTxt ? `<div class="finding-cwe">${escHtml(cweTxt)}</div>` : ''}
-        <div class="finding-snippet">${escHtml(f.raw_text || '')}</div>
-      </div>
-      <div class="conf-bar" style="flex-direction:column;align-items:flex-end;gap:2px">
-        <span>${confPct}%</span>
-        <div style="width:40px;height:4px;background:var(--border);border-radius:2px">
-          <div class="conf-fill" style="width:${confPct}%;background:${confColor}"></div>
-        </div>
-      </div>`;
-
-    card.addEventListener('click', () => {
-      document.querySelectorAll('.finding-card').forEach(c => c.classList.remove('highlight'));
-      card.classList.add('highlight');
-      if (network && f.node_id) {
-        network.selectNodes([f.node_id]);
-        network.focus(f.node_id, { scale: 1.5, animation: true });
-        const node = allNodes && allNodes.get(f.node_id);
-        if (node) showNodeInfo(node);
-      }
-    });
-
-    list.appendChild(card);
-  });
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Clear UI ──────────────────────────────────────────────────────────────
 function clearUI() {
   document.getElementById('log-output').innerHTML   = '';
   document.getElementById('findings-list').innerHTML = '<div class="findings-empty">Waiting for analysis…</div>';
@@ -579,16 +950,16 @@ function clearUI() {
   document.getElementById('node-info').style.display = 'none';
   document.getElementById('graph-empty').style.display = 'flex';
   if (network) { network.destroy(); network = null; }
-  Object.values(stageMap).forEach(id => {
-    document.getElementById(id).className = 'stage-dot';
-  });
+  allNodes = null; allEdges = null; findingCount = 0;
+  Object.values(stageMap).forEach(id => document.getElementById(id).className = 'stage-dot');
   activeDot = null;
+  if (ws) { try { ws.close(); } catch(e) {} ws = null; }
 }
 
 function enableBtn() { document.getElementById('analyze-btn').disabled = false; }
 
 function escHtml(s) {
-  return String(s)
+  return String(s||'')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }

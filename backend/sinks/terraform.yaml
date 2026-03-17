@@ -1,0 +1,93 @@
+# IaC misconfiguration patterns for Terraform HCL and Kubernetes YAML.
+# These map to CPGNode types in the normalised IaC graph.
+
+patterns:
+
+  - vuln_type: "Exposed Admin Port"
+    cwe: "CWE-284"
+    severity: HIGH
+    node_types: [ASSIGN, BLOCK]
+    keywords: ["0.0.0.0", "cidr_blocks", "ingress", "22", "3389", "3306", "5432"]
+    sink_pattern: '(cidr_blocks|source_ranges)\s*=\s*\[.*0\.0\.0\.0/0'
+    sources: []
+    sinks: ["cidr_blocks", "source_ranges", "from_port", "to_port"]
+    sanitizers: []
+    description: >
+      A security group or firewall rule allows inbound traffic from 0.0.0.0/0
+      on an administrative or database port. This exposes the service to the entire internet.
+    remediation: >
+      Restrict cidr_blocks to known IP ranges. Never expose SSH (22), RDP (3389),
+      or database ports (3306, 5432) to 0.0.0.0/0.
+    references:
+      - "https://cwe.mitre.org/data/definitions/284.html"
+
+  - vuln_type: "Hardcoded Secret in IaC"
+    cwe: "CWE-798"
+    severity: HIGH
+    node_types: [ASSIGN, LITERAL]
+    keywords: ["password", "secret", "token", "api_key", "private_key", "access_key"]
+    sink_pattern: '(password|secret|token|api_key|private_key|access_key)\s*=\s*"[^"$][^"]{5,}"'
+    sources: []
+    sinks: ["password", "secret", "token", "api_key", "private_key", "access_key"]
+    sanitizers: ["var.", "data.", "local.", "module.", "vault_generic_secret"]
+    description: >
+      A plaintext secret is hardcoded in a Terraform configuration file.
+      Anyone with repository access can read the credential.
+    remediation: >
+      Use Terraform variables (var.secret) or reference a Vault data source.
+      Never hardcode credentials in .tf files.
+    references:
+      - "https://cwe.mitre.org/data/definitions/798.html"
+
+  - vuln_type: "Overly Permissive IAM Policy"
+    cwe: "CWE-732"
+    severity: HIGH
+    node_types: [ASSIGN, BLOCK]
+    keywords: ["Action", "Resource", "*", "Effect", "Allow"]
+    sink_pattern: '"Action"\s*:\s*"\*"|actions\s*=\s*\["\*"\]'
+    sources: []
+    sinks: ["Action", "actions", "NotAction"]
+    sanitizers: []
+    description: >
+      An IAM policy grants wildcard (*) actions or applies to all resources (*).
+      This violates the principle of least privilege.
+    remediation: >
+      Replace wildcard actions with the minimum specific permissions required.
+      Scope Resource to the exact ARN, not *.
+    references:
+      - "https://cwe.mitre.org/data/definitions/732.html"
+
+  - vuln_type: "Unencrypted Storage"
+    cwe: "CWE-311"
+    severity: MEDIUM
+    node_types: [ASSIGN, BLOCK]
+    keywords: ["encrypted", "storage_encrypted", "encrypt_at_rest", "kms_key_id"]
+    sink_pattern: '(encrypted|storage_encrypted|encrypt_at_rest)\s*=\s*false'
+    sources: []
+    sinks: ["encrypted", "storage_encrypted", "encrypt_at_rest"]
+    sanitizers: ["kms_key_id", "kms_key_arn", "server_side_encryption"]
+    description: >
+      A storage resource (S3 bucket, RDS instance, EBS volume) is provisioned
+      without encryption at rest enabled.
+    remediation: >
+      Set encrypted = true and specify a KMS key. Enable default encryption at the account level.
+    references:
+      - "https://cwe.mitre.org/data/definitions/311.html"
+
+  - vuln_type: "Public S3 Bucket"
+    cwe: "CWE-284"
+    severity: HIGH
+    node_types: [ASSIGN, BLOCK]
+    keywords: ["acl", "public-read", "public-read-write", "block_public_acls"]
+    sink_pattern: 'acl\s*=\s*"(public-read|public-read-write|authenticated-read)"'
+    sources: []
+    sinks: ["acl", "block_public_acls", "block_public_policy"]
+    sanitizers: ["block_public_acls = true", "block_public_policy = true"]
+    description: >
+      An S3 bucket is configured with a public ACL, exposing its contents
+      to unauthenticated internet access.
+    remediation: >
+      Set acl = "private". Enable all four S3 Block Public Access settings.
+      Use bucket policies for controlled sharing.
+    references:
+      - "https://cwe.mitre.org/data/definitions/284.html"

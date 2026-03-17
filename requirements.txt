@@ -1,39 +1,60 @@
-# Tree-sitter: multi-language parsing (pre-compiled grammars for 40+ languages)
-# Covers: Python, Java, JS, TS, TSX, C, C++, Rust, Go, HCL, YAML
-tree-sitter-language-pack
-tree-sitter
 
-# Pydantic v2: DeploymentContext validation (used in IaC generation stage)
-pydantic
+# External tools (NOT pip-installable — see setup guide):
+#   Joern  : ~/tools/joern/joern-cli/joern-parse
+#   CodeQL : ~/tools/codeql-home/codeql/codeql
+#   Java 17+: required by Joern (sudo apt install openjdk-17-jdk)
 
-# Testing
-pytest
-pytest-cov
-dulwich
-pygit2
-
-# Utilities
-pathlib2
-
+# ── Web framework ────────────────────────────────────────────
 fastapi
-langgraph
+uvicorn[standard]
+websockets
+python-multipart # form/file upload support for FastAPI
+jinja2 
+
+# ── Data validation ──────────────────────────────────────────
+pydantic
+pydantic-settings
+python-dotenv
+
+# ── Graph database ───────────────────────────────────────────
+neo4j
+
+# ── Parsing & AST ────────────────────────────────────────────
+# Tree-sitter core framework
+tree-sitter
+# Language grammar bundle — provides all language bindings:
+# Python, Java, JavaScript, TypeScript, TSX, Go, Rust, C, C++,
+# Bash, Ruby, PHP, C#, and more in a single package.
+tree-sitter-languages
+
+# ── YAML (required for sink pattern loader) ──────────────────
+pyyaml==6.0.1
+
+# ── HTTP client ──────────────────────────────────────────────
+httpx
+aiohttp  # async HTTP for agent tool calls
+aiofiles # async file I/O in sandbox layer
+
+# ── Secrets management ───────────────────────────────────────
+hvac # HashiCorp Vault client
+
+# ── Agent orchestration (LangGraph pipeline) ─────────────────
 langchain
-dulwich
-pygit2
-hvac
-# ── CodeQL: installed separately (not via pip) ──────────────────────────────
-# Download from: https://github.com/github/codeql-cli-binaries/releases
-# Set env vars:
-#   CODEQL_CLI_PATH=/usr/local/bin/codeql
-#   CODEQL_SEARCH_PATH=/opt/codeql-home/codeql
-#
-# Clone libraries:
-#   git clone https://github.com/github/codeql /opt/codeql-home/codeql
+langchain-core
+langgraph
 
-# ── Azure replacements (install as needed) ─────────────────────────────
-# Sandbox:     docker (system package) + gvisor (https://gvisor.dev/docs/user_guide/install/)
-hvac
-# Blockchain:  web3>=6.0.0  (Ganache local testnet)
-# Graph DB:    neo4j>=5.0.0  (or use Joern's built-in graph DB)
-# Monitoring:  prometheus-client>=0.17.0
+# ── Blockchain audit layer ───────────────────────────────────
+web3 # Ethereum Sepolia hash logging
 
+# ── ML / GraphCodeBERT (install separately, GPU optional) ────
+# Uncomment when wiring in the GraphCodeBERT inference layer.
+# torch
+# transformers
+# peft # LoRA adapter support
+# datasets   # Devign / Big-Vul / VDISC loaders
+# scikit-learn # evaluation metrics
+
+# ── Testing ──────────────────────────────────────────────────
+pytest
+pytest-asyncio
+pytest-cov

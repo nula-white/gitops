@@ -1,2 +1,6 @@
 .env
-setup_prism_secrets.sh
+vault/data/
+vault/logs/
+vault/vault-keys.txt
+__pycache__/
+*.pyc

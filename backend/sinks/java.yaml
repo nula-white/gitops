@@ -1,0 +1,85 @@
+# backend/sinks/java.yaml
+
+patterns:
+
+  - vuln_type: "SQL Injection"
+    cwe: "CWE-89"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["executeQuery", "executeUpdate", "execute", "createStatement", "prepareStatement"]
+    sink_pattern: '\.(executeQuery|executeUpdate|execute|createStatement)\s*\('
+    sources: ["request.getParameter", "request.getHeader", "getQueryString", "getInputStream"]
+    sinks: ["executeQuery", "executeUpdate", "execute", "createStatement", "nativeQuery"]
+    sanitizers: ["prepareStatement", "PreparedStatement", "setString", "setInt", "TypedQuery"]
+    description: >
+      User-controlled data flows into a JDBC query without parameterisation.
+    remediation: >
+      Always use PreparedStatement with parameter binding. Never concatenate user input into SQL.
+    references:
+      - "https://owasp.org/www-community/attacks/SQL_Injection"
+      - "https://cwe.mitre.org/data/definitions/89.html"
+
+  - vuln_type: "Command Injection"
+    cwe: "CWE-78"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["Runtime.exec", "ProcessBuilder", "exec("]
+    sink_pattern: '(Runtime\.getRuntime\(\)\.exec|ProcessBuilder|exec)\s*\('
+    sources: ["request.getParameter", "request.getHeader", "getQueryString"]
+    sinks: ["Runtime.exec", "ProcessBuilder.command", "exec"]
+    sanitizers: []
+    description: >
+      Unsanitised input is passed to a system command.
+    remediation: >
+      Use ProcessBuilder with a string array. Never pass user input directly to Runtime.exec.
+    references:
+      - "https://cwe.mitre.org/data/definitions/78.html"
+
+  - vuln_type: "Path Traversal"
+    cwe: "CWE-22"
+    severity: MEDIUM
+    node_types: [CALL, ASSIGN]
+    keywords: ["new File(", "FileInputStream", "FileReader", "Paths.get"]
+    sink_pattern: '(new\s+File\s*\(|FileInputStream|FileReader|Paths\.get)\s*\('
+    sources: ["request.getParameter", "request.getHeader", "getQueryString"]
+    sinks: ["new File", "FileInputStream", "FileReader", "Paths.get", "new FileOutputStream"]
+    sanitizers: ["getCanonicalPath", "normalize", "toRealPath"]
+    description: >
+      A file path constructed from user input may allow directory traversal.
+    remediation: >
+      Call getCanonicalPath() and verify the result starts with the allowed base directory.
+    references:
+      - "https://cwe.mitre.org/data/definitions/22.html"
+
+  - vuln_type: "Insecure Deserialisation"
+    cwe: "CWE-502"
+    severity: HIGH
+    node_types: [CALL, ASSIGN]
+    keywords: ["ObjectInputStream", "readObject", "XMLDecoder", "XStream"]
+    sink_pattern: '(ObjectInputStream|readObject|XMLDecoder|XStream\.fromXML)\s*[\(\.]'
+    sources: ["request.getInputStream", "getInputStream", "socket.getInputStream"]
+    sinks: ["readObject", "readUnshared", "XMLDecoder.readObject", "XStream.fromXML"]
+    sanitizers: ["ValidatingObjectInputStream", "SerialKiller"]
+    description: >
+      Deserialising untrusted Java objects can lead to remote code execution.
+    remediation: >
+      Use ValidatingObjectInputStream with an allowlist. Prefer JSON/Protobuf for external data.
+    references:
+      - "https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data"
+      - "https://cwe.mitre.org/data/definitions/502.html"
+
+  - vuln_type: "Hardcoded Secret"
+    cwe: "CWE-798"
+    severity: MEDIUM
+    node_types: [ASSIGN, LITERAL]
+    keywords: ["password", "secret", "apiKey", "token", "privateKey", "passwd"]
+    sink_pattern: '(password|secret|apiKey|token|privateKey|passwd)\s*=\s*"[^"]{6,}"'
+    sources: []
+    sinks: ["password", "secret", "apiKey", "token", "privateKey"]
+    sanitizers: ["System.getenv", "Properties", "@Value", "vault"]
+    description: >
+      A credential or secret is hardcoded in Java source code.
+    remediation: >
+      Externalise secrets via environment variables, Spring @Value, or a secrets manager.
+    references:
+      - "https://cwe.mitre.org/data/definitions/798.html"
