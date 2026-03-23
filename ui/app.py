@@ -1,993 +1,755 @@
 """
-PRISM Dashboard — app.py
-========================
-FastAPI app with dual transport:
-  • SSE   — pipeline log + progress events (unchanged from original)
-  • WebSocket — real-time node/edge streaming as CPG is built
+PRISM UI — Flask dashboard
+===========================
+Bridges the LangGraph/FastAPI pipeline to the legacy Flask frontend.
 
-Pipeline stages:
-  1. Credential acquisition  (token → SecureString / Vault)
-  2. Repository ingestion    (TLS git clone, SHA pinning, integrity check)
-  3. gVisor sandbox delivery (copy verified files into runsc container)
-  4. CPG construction        (Joern / Tree-sitter / fallback regex)
-  5. Vulnerability detection (CodeQL SARIF + DFG path queries)
-  6. Graph streaming         (nodes + edges sent over WebSocket in real time)
+Routes:
+  GET  /                         — main dashboard
+  POST /api/analyze              — start analysis (inline code or repo URL)
+  GET  /api/session/<id>/events  — SSE stream of pipeline events + metrics
+  GET  /api/session/<id>/graph   — CPG graph JSON for vis.js
+  GET  /api/session/<id>/findings — vulnerability findings JSON
+  GET  /api/session/<id>/status  — pipeline status + stage results
+  GET  /api/session/<id>/metrics — live performance metrics
+  POST /api/session/<id>/hitl/approve  — HITL approval
+  POST /api/session/<id>/hitl/reject   — HITL rejection
+  GET  /api/session/<id>/hitl/status   — HITL gate state
 
-gVisor integration:
-  The analysed code never touches the host filesystem directly.
-  Files are copied into a Docker container running under the gVisor
-  runtime (--runtime=runsc). The container has:
-    • read-only bind-mount of the cloned repo
-    • no network access
-    • no host device access
-  This provides a microVM-level isolation boundary between potentially
-  malicious repository code and the analyst's machine.
-
-Run:
-    pip install fastapi uvicorn jinja2
-    uvicorn ui.app:app --host 0.0.0.0 --port 5001
+Events streamed via SSE include:
+  phase, node, edge, finding, annotation, hitl_waiting,
+  metrics_update, complete, error, heartbeat
 """
-
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import queue
-import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
-# ── FastAPI (replaces Flask + flask-sock) ─────────────────────────────────────
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.requests import Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
-# ── PRISM pipeline imports (graceful degradation) ─────────────────────────────
-try:
-    from ..ingestion.pipeline import run_ingestion
-    from ..ingestion.models import GitProvider, IngestionRequest
-    from ..parser.registry import ParserRegistry
-    _PIPELINE_AVAILABLE = True
-except ImportError:
-    _PIPELINE_AVAILABLE = False
-    logging.warning("PRISM pipeline not importable — running in demo mode")
-
-# ── Optional: cpg_builder for real-time streaming ─────────────────────────────
-try:
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
-    from core.cpg_builder import extract_nodes, _build_cfg_edges, _build_dfg_edges, detect_vulnerabilities
-    import asyncio as _asyncio
-    _CPG_BUILDER_AVAILABLE = True
-except ImportError:
-    _CPG_BUILDER_AVAILABLE = False
-
-# ─────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="PRISM Dashboard")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(name)-22s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
 )
+log = logging.getLogger("prism.ui")
 
-_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
-_STATIC_DIR   = Path(__file__).resolve().parent / "static"
+# ── Add project root to path ──────────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
 
-templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+app = Flask(__name__, template_folder="templates", static_folder="static")
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET", "prism-dev-secret")
 
-if _STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+# ── Session store ─────────────────────────────────────────────────────────────
+# Each session:  { log_queue, graph_queue, graph, findings, status, ... }
+_sessions: dict[str, dict] = {}
 
-# ── Per-session state ─────────────────────────────────────────────────────────
-_sessions: dict[str, dict[str, Any]] = {}
-_sessions_lock = threading.Lock()
+# ── Pipeline availability ─────────────────────────────────────────────────────
+_PIPELINE_AVAILABLE = False
+_PARSER_AVAILABLE   = False
+_METRICS_AVAILABLE  = False
 
-logger = logging.getLogger("prism.ui")
+try:
+    from ingestion.pipeline import run_ingestion
+    from ingestion.models   import GitProvider, IngestionRequest
+    from ingestion.credential_provider import EnvCredentialProvider
+    _PIPELINE_AVAILABLE = True
+except ImportError as e:
+    log.warning("Ingestion not importable (%s) — demo mode", e)
+
+try:
+    from parser.registry import ParserRegistry
+    _PARSER_AVAILABLE = True
+except ImportError as e:
+    log.warning("Parser not importable (%s) — demo mode", e)
+
+try:
+    from backend.api.metrics_endpoints import update_from_pipeline_state
+    _METRICS_AVAILABLE = True
+except ImportError:
+    pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# gVisor sandbox helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
-def _gvisor_available() -> bool:
-    """Check whether the gVisor runtime (runsc) is installed and Docker knows it."""
-    try:
-        out = subprocess.run(
-            ["docker", "info", "--format", "{{json .Runtimes}}"],
-            capture_output=True, text=True, timeout=5
-        )
-        return "runsc" in out.stdout
-    except Exception:
-        return False
+@app.route("/")
+def index():
+    return render_template("index.html")
 
 
-def _run_in_gvisor_sandbox(repo_dir: str, session_id: str,
-                            push_fn, push_progress_fn) -> str:
+@app.route("/api/analyze", methods=["POST"])
+def start_analysis():
     """
-    Copy the repository into a gVisor-isolated Docker container and
-    return the path to the analysis output directory on the host.
-
-    Container spec:
-      • Image: python:3.11-slim  (or a custom PRISM analysis image)
-      • Runtime: runsc (gVisor) — microVM isolation
-      • Mount: repo_dir → /workspace:ro
-      • Network: none
-      • Output: /output bind-mounted to a temp dir on host
-
-    Falls back to plain Docker if gVisor is unavailable,
-    and to direct host execution if Docker is unavailable.
-    Returns the output directory path.
+    Start a pipeline session.  Accepts JSON:
+      { repo_url, branch, commit_sha, token, max_repo_mb }
+      OR
+      { code, language, filename }  (inline snippet mode)
     """
-    output_dir = tempfile.mkdtemp(prefix=f"prism_out_{session_id[:8]}_")
+    data       = request.get_json(force=True, silent=True) or {}
+    session_id = f"prism_{uuid.uuid4().hex[:12]}"
 
-    if not shutil.which("docker"):
-        push_fn("⚠️  Docker not found — running analysis directly on host (reduced isolation)", "warning", "sandbox")
-        push_progress_fn("sandbox", 35)
-        return repo_dir
+    log_q   = queue.Queue(maxsize=2000)
+    graph_q = queue.Queue(maxsize=5000)
 
-    use_gvisor = _gvisor_available()
-    runtime_flag = ["--runtime=runsc"] if use_gvisor else []
-    isolation_note = "gVisor (runsc) microVM" if use_gvisor else "standard Docker (gVisor not detected)"
-
-    push_fn(f"🔒 Stage 3 — Sandbox isolation: {isolation_note}", "info", "sandbox")
-
-    container_name = f"prism-sandbox-{session_id[:12]}"
-    try:
-        cmd = [
-            "docker", "run",
-            "--name", container_name,
-            "--rm",
-            *runtime_flag,
-            "--network=none",
-            "--read-only",
-            "--tmpfs", "/tmp:size=256m",
-            f"--volume={repo_dir}:/workspace:ro",
-            f"--volume={output_dir}:/output:rw",
-            "--memory=512m",
-            "--cpus=1",
-            "--user=nobody",
-            "python:3.11-slim",
-            "python3", "-c",
-            # Minimal analysis script that runs inside the container:
-            # copies workspace to output so the host pipeline can read it
-            "import shutil, os; shutil.copytree('/workspace', '/output/repo', dirs_exist_ok=True); print('sandbox-ok')"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and "sandbox-ok" in result.stdout:
-            sandbox_repo = os.path.join(output_dir, "repo")
-            push_fn(f"  ✅ Sandbox container exited cleanly — repo at {sandbox_repo}", "info", "sandbox")
-            push_progress_fn("sandbox", 35)
-            return sandbox_repo
-        else:
-            push_fn(f"  ⚠️  Sandbox exit code {result.returncode}: {result.stderr[:200]}", "warning", "sandbox")
-            push_fn("  Falling back to direct host analysis", "warning", "sandbox")
-            push_progress_fn("sandbox", 35)
-            return repo_dir
-    except subprocess.TimeoutExpired:
-        push_fn("  ⚠️  Sandbox timed out — falling back to direct analysis", "warning", "sandbox")
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-        return repo_dir
-    except Exception as exc:
-        push_fn(f"  ⚠️  Sandbox error ({exc}) — falling back to direct analysis", "warning", "sandbox")
-        return repo_dir
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging bridge
-# ─────────────────────────────────────────────────────────────────────────────
-
-class _QueueHandler(logging.Handler):
-    def __init__(self, q: "queue.Queue[dict]") -> None:
-        super().__init__()
-        self.q = q
-
-    def emit(self, record: logging.LogRecord) -> None:
-        level_map = {
-            logging.DEBUG: "debug", logging.INFO: "info",
-            logging.WARNING: "warning", logging.ERROR: "error",
-            logging.CRITICAL: "error",
-        }
-        self.q.put_nowait({
-            "type": "log", "level": level_map.get(record.levelno, "info"),
-            "logger": record.name, "message": self.format(record),
-            "ts": round(time.time() * 1000),
-        })
-
-
-def _make_session(session_id: str) -> dict[str, Any]:
-    s = {
+    session = {
         "session_id": session_id,
-        "status":     "idle",
-        "log_queue":  queue.Queue(maxsize=2000),
-        # Real-time graph queue — fed by the CPG builder, consumed by WS handler
-        "graph_queue": queue.Queue(maxsize=5000),
-        "graph":       None,
+        "log_queue":   log_q,
+        "graph_queue": graph_q,
+        "graph":       {"nodes": [], "edges": [], "summary": {}},
         "findings":    [],
+        "status":      "pending",
         "error":       None,
-        "created_at":  time.time(),
+        "hitl_state":  "not_reached",  # waiting | approved | rejected | not_reached
+        "hitl_notes":  "",
+        "metrics":     {},
+        "started_at":  time.time(),
     }
-    with _sessions_lock:
-        _sessions[session_id] = s
-    return s
+    _sessions[session_id] = session
 
+    # Inline code mode (quick analysis)
+    if data.get("code"):
+        t = threading.Thread(
+            target=_run_inline_pipeline,
+            args=(session, data.get("code", ""),
+                  data.get("language", "python"),
+                  data.get("filename", "snippet.py")),
+            daemon=True,
+        )
+        t.start()
+        return jsonify({"session_id": session_id, "mode": "inline"})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("index.html", {"request": request})
-
-
-@app.get("/api/status")
-async def api_status() -> JSONResponse:
-    return JSONResponse({
-        "pipeline_available": _PIPELINE_AVAILABLE,
-        "gvisor_available":   _gvisor_available(),
-        "vault_addr":         os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200"),
-        "vault_connected":    _check_vault(),
-    })
-
-
-@app.post("/api/analyze")
-async def api_analyze(request: Request) -> JSONResponse:
-    """
-    Start a new analysis session.
-
-    Request body (JSON):
-        repo_url      : "https://github.com/owner/repo"
-        branch        : "main"
-        commit_sha    : optional
-        github_token  : PAT (never logged, held in SecureString)
-        max_repo_mb   : optional int (default 100)
-
-    Response:
-        {"session_id": "sess_abc123", "ws_url": "/ws/graph/sess_abc123"}
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    repo_url    = (body.get("repo_url") or "").strip()
-    branch      = (body.get("branch") or "main").strip()
-    commit_sha  = (body.get("commit_sha") or "").strip() or None
-    token       = (body.get("github_token") or "").strip()
-    max_repo_mb = int(body.get("max_repo_mb") or 100)
-
+    # Repository mode (full pipeline)
+    repo_url = data.get("repo_url", "").strip()
     if not repo_url:
-        return JSONResponse({"error": "repo_url is required"}, status_code=400)
-    if not repo_url.startswith("https://"):
-        return JSONResponse({"error": "Only HTTPS repository URLs are accepted"}, status_code=400)
+        return jsonify({"error": "repo_url or code is required"}), 400
 
-    session_id = f"sess_{uuid.uuid4().hex[:12]}"
-    session    = _make_session(session_id)
+    branch     = data.get("branch", "main")
+    commit_sha = data.get("commit_sha") or None
+    token      = data.get("token", "") or os.environ.get("PRISM_GIT_TOKEN", "")
+    max_mb     = int(data.get("max_repo_mb", 100))
+
+    session["repo_url"] = repo_url
+    session["branch"]   = branch
 
     t = threading.Thread(
-        target=_run_pipeline_bg,
-        args=(session, repo_url, branch, commit_sha, token, max_repo_mb),
+        target=_run_repo_pipeline,
+        args=(session, repo_url, branch, commit_sha, token, max_mb),
         daemon=True,
-        name=f"prism-{session_id[:8]}",
     )
     t.start()
 
-    return JSONResponse({
+    return jsonify({"session_id": session_id, "mode": "repository", "repo_url": repo_url})
+
+
+# ── HITL endpoints ────────────────────────────────────────────────────────────
+
+@app.route("/api/session/<session_id>/hitl/status")
+def hitl_status(session_id: str):
+    s = _get_session(session_id)
+    return jsonify({
         "session_id": session_id,
-        "ws_url": f"/ws/graph/{session_id}",
+        "state":      s.get("hitl_state", "not_reached"),
+        "notes":      s.get("hitl_notes", ""),
+        "operator":   s.get("hitl_operator", ""),
+        "summary":    _build_hitl_summary(s),
     })
 
 
-@app.get("/api/session/{session_id}/events")
-async def session_events(session_id: str, request: Request) -> StreamingResponse:
-    """SSE stream — log messages + progress for the left panel."""
-    session = _sessions.get(session_id)
-    if not session:
-        return JSONResponse({"error": "session not found"}, status_code=404)
+@app.route("/api/session/<session_id>/hitl/approve", methods=["POST"])
+def hitl_approve(session_id: str):
+    s = _get_session(session_id)
+    data = request.get_json(force=True, silent=True) or {}
+    operator = data.get("operator", "anonymous")
+    notes    = data.get("notes", "")
 
-    async def generate() -> AsyncGenerator[str, None]:
-        q: queue.Queue = session["log_queue"]
+    log.info("HITL APPROVED  session=%s  operator=%s", session_id, operator)
+    s["hitl_state"]    = "approved"
+    s["hitl_notes"]    = notes
+    s["hitl_operator"] = operator
+
+    # Push a WebSocket-style event onto the graph queue
+    s["graph_queue"].put_nowait({
+        "type": "phase",
+        "payload": {
+            "stage":    "hitl1_checkpoint",
+            "label":    f"✅ HITL approved by {operator}",
+            "approved": True,
+        },
+    })
+
+    # Resume the background pipeline thread if it's waiting
+    event = s.get("_hitl_event")
+    if event:
+        event.set()
+
+    return jsonify({"status": "approved", "session_id": session_id})
+
+
+@app.route("/api/session/<session_id>/hitl/reject", methods=["POST"])
+def hitl_reject(session_id: str):
+    s = _get_session(session_id)
+    data = request.get_json(force=True, silent=True) or {}
+    operator = data.get("operator", "anonymous")
+    notes    = data.get("notes", "")
+
+    log.warning("HITL REJECTED  session=%s  operator=%s  reason=%s",
+                session_id, operator, notes[:100])
+    s["hitl_state"]    = "rejected"
+    s["hitl_notes"]    = notes
+    s["hitl_operator"] = operator
+
+    s["graph_queue"].put_nowait({
+        "type": "phase",
+        "payload": {
+            "stage":    "hitl1_checkpoint",
+            "label":    f"❌ Rejected by {operator}: {notes[:60]}",
+            "approved": False,
+        },
+    })
+
+    event = s.get("_hitl_event")
+    if event:
+        event.set()
+
+    return jsonify({"status": "rejected", "session_id": session_id})
+
+
+# ── Data endpoints ────────────────────────────────────────────────────────────
+
+@app.route("/api/session/<session_id>/graph")
+def get_graph(session_id: str):
+    s = _get_session(session_id)
+    return jsonify(s.get("graph", {"nodes": [], "edges": [], "summary": {}}))
+
+
+@app.route("/api/session/<session_id>/findings")
+def get_findings(session_id: str):
+    s = _get_session(session_id)
+    return jsonify({"findings": s.get("findings", [])})
+
+
+@app.route("/api/session/<session_id>/status")
+def get_status(session_id: str):
+    s = _get_session(session_id)
+    return jsonify({
+        "session_id":  session_id,
+        "status":      s.get("status", "unknown"),
+        "error":       s.get("error"),
+        "hitl_state":  s.get("hitl_state", "not_reached"),
+        "stage_results": s.get("stage_results", []),
+        "total_files":   s.get("total_files", 0),
+        "finding_count": len(s.get("findings", [])),
+    })
+
+
+@app.route("/api/session/<session_id>/metrics")
+def get_metrics(session_id: str):
+    s = _get_session(session_id)
+    return jsonify(_compute_metrics(s))
+
+
+@app.route("/api/sessions")
+def list_sessions():
+    return jsonify({
+        "sessions": [
+            {
+                "session_id": sid,
+                "status":     s.get("status"),
+                "repo_url":   s.get("repo_url", ""),
+                "started_at": s.get("started_at", 0),
+                "findings":   len(s.get("findings", [])),
+            }
+            for sid, s in _sessions.items()
+        ]
+    })
+
+
+# ── SSE event stream ──────────────────────────────────────────────────────────
+
+@app.route("/api/session/<session_id>/events")
+def event_stream(session_id: str):
+    """
+    Server-Sent Events stream.  Merges:
+      - pipeline log events  (from log_queue)
+      - graph events         (from graph_queue)
+      - metrics snapshots    (every 1s)
+      - HITL state changes
+    """
+    s = _sessions.get(session_id)
+    if not s:
+        def empty():
+            yield f"data: {json.dumps({'type':'error','payload':{'message':'Session not found'}})}\n\n"
+        return Response(stream_with_context(empty()), mimetype="text/event-stream")
+
+    def generate():
+        last_metrics_ts = 0.0
+        heartbeat_ts    = 0.0
+        last_hitl       = s.get("hitl_state", "not_reached")
+        idle_count      = 0
+
         while True:
-            # honour client disconnect
-            if await request.is_disconnected():
-                return
+            emitted = False
+            now = time.time()
 
-            status = session["status"]
-            try:
-                event = q.get_nowait()
-                yield f"data: {json.dumps(event)}\n\n"
-            except queue.Empty:
-                # replaces the blocking q.get(timeout=0.5) from the Flask version
-                await asyncio.sleep(0.1)
-                yield f"data: {json.dumps({'type': 'heartbeat', 'status': status})}\n\n"
+            # Drain log queue
+            while True:
+                try:
+                    evt = s["log_queue"].get_nowait()
+                    yield f"data: {json.dumps(evt)}\n\n"
+                    emitted = True
+                except queue.Empty:
+                    break
 
-            if status in ("complete", "failed"):
-                while not q.empty():
-                    try:
-                        yield f"data: {json.dumps(q.get_nowait())}\n\n"
-                    except queue.Empty:
-                        break
-                payload: dict[str, Any] = {"type": "final", "status": status}
-                if status == "complete":
-                    payload["findings"] = session.get("findings", [])
-                    payload["summary"]  = (session.get("graph") or {}).get("summary", {})
-                else:
-                    payload["error"] = session.get("error")
-                yield f"data: {json.dumps(payload)}\n\n"
-                return
+            # Drain graph event queue
+            batch = 0
+            while batch < 50:
+                try:
+                    evt = s["graph_queue"].get_nowait()
+                    yield f"data: {json.dumps(evt)}\n\n"
+                    emitted = True
+                    batch += 1
+                except queue.Empty:
+                    break
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
+            # Emit metrics every 1s
+            if now - last_metrics_ts >= 1.0:
+                metrics = _compute_metrics(s)
+                yield f"data: {json.dumps({'type': 'metrics_update', 'payload': metrics})}\n\n"
+                last_metrics_ts = now
+                emitted = True
+
+            # Emit HITL state change
+            current_hitl = s.get("hitl_state", "not_reached")
+            if current_hitl != last_hitl:
+                last_hitl = current_hitl
+                yield f"data: {json.dumps({'type': 'hitl_state', 'payload': {'state': current_hitl, 'summary': _build_hitl_summary(s)}})}\n\n"
+                emitted = True
+
+            # Heartbeat every 15s
+            if now - heartbeat_ts >= 15.0:
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                heartbeat_ts = now
+
+            if not emitted:
+                idle_count += 1
+            else:
+                idle_count = 0
+
+            status = s.get("status", "")
+            if status in ("complete", "failed") and idle_count > 10:
+                yield f"data: {json.dumps({'type': 'stream_end', 'payload': {'status': status}})}\n\n"
+                break
+
+            time.sleep(0.1)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
         headers={
             "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*",
+            "Connection":        "keep-alive",
         },
     )
 
 
-@app.get("/api/session/{session_id}/findings")
-async def session_findings(session_id: str) -> JSONResponse:
-    session = _sessions.get(session_id)
-    if not session:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-    return JSONResponse(session.get("findings") or [])
+# ── Pipeline runners ──────────────────────────────────────────────────────────
+
+def _push_log(s: dict, msg: str, level: str = "info", stage: str = "") -> None:
+    s["log_queue"].put_nowait({
+        "type":    "log",
+        "level":   level,
+        "message": msg,
+        "stage":   stage,
+        "ts":      round(time.time() * 1000),
+    })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WebSocket endpoint — real-time node/edge streaming
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.websocket("/ws/graph/{session_id}")
-async def ws_graph(websocket: WebSocket, session_id: str) -> None:
-    """
-    WebSocket endpoint that streams CPG nodes + edges as they are built.
-    The client connects immediately after receiving the session_id from
-    /api/analyze. Events are the same schema as the FastAPI backend:
-
-        {"type": "phase",       "payload": {"stage": "...", "label": "..."}}
-        {"type": "node",        "payload": {CPGNode dict}}
-        {"type": "edge",        "payload": {CPGEdge dict}}
-        {"type": "annotation",  "payload": {"node_id": ..., "severity": ...}}
-        {"type": "finding",     "payload": {VulnerabilityFinding dict}}
-        {"type": "complete",    "payload": {"node_count": ..., "edge_count": ..., "finding_count": ...}}
-        {"type": "heartbeat"}
-        {"type": "error",       "payload": {"message": "..."}}
-    """
-    await websocket.accept()
-
-    session = _sessions.get(session_id)
-    if not session:
-        await websocket.send_text(json.dumps({"type": "error", "payload": {"message": "session not found"}}))
-        await websocket.close()
-        return
-
-    gq: queue.Queue = session["graph_queue"]
-    last_heartbeat = time.time()
-
-    try:
-        while True:
-            try:
-                event = gq.get_nowait()
-                # replaces the blocking gq.get(timeout=0.3) from the Flask version
-                await websocket.send_text(json.dumps(event))
-                if event.get("type") in ("complete", "error"):
-                    break
-            except queue.Empty:
-                # yield control to the event loop instead of blocking
-                await asyncio.sleep(0.05)
-                # Send heartbeat every 10 s to keep WS alive
-                if time.time() - last_heartbeat > 10:
-                    await websocket.send_text(json.dumps({"type": "heartbeat"}))
-                    last_heartbeat = time.time()
-                # Check if session failed externally
-                if session["status"] == "failed":
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "payload": {"message": session.get("error", "Pipeline failed")},
-                    }))
-                    break
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+def _push_phase(s: dict, stage: str, label: str) -> None:
+    s["graph_queue"].put_nowait({
+        "type":    "phase",
+        "payload": {"stage": stage, "label": label},
+    })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline background worker
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _push_to_ws(gq: queue.Queue, event_type: str, payload: Any = None) -> None:
-    """Put an event onto the graph WebSocket queue (non-blocking, drop if full)."""
-    evt: dict = {"type": event_type}
-    if payload is not None:
-        evt["payload"] = payload
-    try:
-        gq.put_nowait(evt)
-    except queue.Full:
-        pass
+def _push_node(s: dict, node_data: dict) -> None:
+    s["graph_queue"].put_nowait({"type": "node", "payload": node_data})
 
 
-def _run_pipeline_bg(
-    session: dict[str, Any],
-    repo_url: str,
-    branch: str,
-    commit_sha: str | None,
-    token: str,
+def _push_edge(s: dict, edge_data: dict) -> None:
+    s["graph_queue"].put_nowait({"type": "edge", "payload": edge_data})
+
+
+def _push_finding(s: dict, finding: dict) -> None:
+    s["graph_queue"].put_nowait({"type": "finding", "payload": finding})
+
+
+def _push_annotation(s: dict, node_id: str, severity: str) -> None:
+    s["graph_queue"].put_nowait({
+        "type": "annotation",
+        "payload": {"node_id": node_id, "annotated": True, "severity": severity},
+    })
+
+
+def _run_repo_pipeline(
+    session:     dict,
+    repo_url:    str,
+    branch:      str,
+    commit_sha:  str | None,
+    token:       str,
     max_repo_mb: int,
 ) -> None:
-    q:  queue.Queue = session["log_queue"]
-    gq: queue.Queue = session["graph_queue"]
-    session_id = session["session_id"]
-
-    handler = _QueueHandler(q)
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    prism_root = logging.getLogger("prism")
-    prism_root.addHandler(handler)
-    prism_root.setLevel(logging.DEBUG)
-
-    def push(msg: str, level: str = "info", stage: str = "") -> None:
-        q.put_nowait({
-            "type": "log", "level": level,
-            "logger": "prism.ui", "message": msg,
-            "stage": stage, "ts": round(time.time() * 1000),
-        })
-
-    def push_progress(stage: str, pct: int) -> None:
-        q.put_nowait({"type": "progress", "stage": stage, "pct": pct})
-
-    def ws_phase(stage: str, label: str) -> None:
-        _push_to_ws(gq, "phase", {"stage": stage, "label": label})
-
+    """Full repository pipeline running in a daemon thread."""
+    # Import the real pipeline runner
     try:
+        from backend.core.cpg_builder import run_real_pipeline
+        run_real_pipeline(session, repo_url, branch, commit_sha, token, max_repo_mb)
+    except ImportError:
+        _push_log(session, "cpg_builder not importable — running minimal demo", "warning")
+        _run_demo_pipeline(session, repo_url)
+
+
+def _run_inline_pipeline(
+    session: dict, code: str, language: str, filename: str
+) -> None:
+    """Inline code snippet analysis."""
+    try:
+        from backend.core.cpg_builder import _serialise_node, _serialise_edge, _serialise_finding, _VIS_MAX_NODES, _VIS_MAX_EDGES
+        _push_phase(session, "PARSE", "Parsing inline snippet...")
         session["status"] = "running"
 
-        # ── Demo mode ─────────────────────────────────────────────────────────
-        if not _PIPELINE_AVAILABLE:
-            push("⚠️  Running in DEMO mode — PRISM pipeline not installed", "warning")
-            time.sleep(0.3)
-            _inject_demo_data(session, repo_url, q, gq)
-            session["status"] = "complete"
+        if not _PARSER_AVAILABLE:
+            _run_demo_pipeline(session, f"inline:{filename}")
             return
-
-        push(f"▶ Starting analysis: {repo_url}", "info", "init")
-        push(f"  Branch: {branch}  |  Session: {session_id}", "info", "init")
-        push_progress("init", 5)
-        ws_phase("PARSE", "Initialising…")
-
-        # ── Stage 1: Credentials ──────────────────────────────────────────────
-        push("🔑 Stage 1 — Credential acquisition", "info", "credential")
-        ws_phase("PARSE", "Acquiring credentials…")
-        from ..ingestion.credential_provider import EnvCredentialProvider
-        provider = EnvCredentialProvider(direct_token=token if token else None)
-        push_progress("credential", 12)
-
-        # ── Stage 2: Ingestion ────────────────────────────────────────────────
-        push("📥 Stage 2 — Repository ingestion (TLS + SHA pinning + integrity check)", "info", "ingestion")
-        ws_phase("AST", "Cloning repository…")
-        sandbox_clone_dir = tempfile.mkdtemp(prefix=f"prism_clone_{session_id[:8]}_")
-
-        req_obj = IngestionRequest(
-            repo_url=repo_url, provider=GitProvider.GITHUB,
-            branch=branch, commit_sha=commit_sha,
-            credential_ref="github", output_dir=sandbox_clone_dir,
-            session_id=session_id, max_repo_size_mb=max_repo_mb,
-        )
-        result = run_ingestion(req_obj, credential_provider=provider)
-
-        if not result.succeeded:
-            push(f"❌ Ingestion failed: {result.error}", "error", "ingestion")
-            session["error"] = result.error
-            session["status"] = "failed"
-            _push_to_ws(gq, "error", {"message": result.error})
-            return
-
-        push(
-            f"  ✅ {result.manifest.total_files} files cloned — "
-            f"repo_hash={result.manifest.repo_hash[:16]}…", "info", "ingestion",
-        )
-        for w in result.warnings:
-            push(f"  ⚠️  {w}", "warning", "ingestion")
-        push_progress("ingestion", 30)
-
-        # ── Stage 3: gVisor sandbox ───────────────────────────────────────────
-        ws_phase("NORMALIZE", "Isolating in gVisor sandbox…")
-        analysis_dir = _run_in_gvisor_sandbox(
-            result.output_dir, session_id, push, push_progress
-        )
-
-        # ── Stage 4: CPG construction + real-time streaming ───────────────────
-        push("🔬 Stage 4 — CPG construction (Joern + Tree-sitter + fallback)", "info", "parsing")
-        ws_phase("CFG", "Building CPG…")
 
         registry = ParserRegistry()
-        bs = registry.get_backend_status()
-        push(
-            f"  Backends: joern={bs['joern_available']} | "
-            f"tree_sitter={bs['tree_sitter_available']} | "
-            f"codeql={bs['codeql_available']}",
-            "info", "parsing",
-        )
+        result = registry.parse_file(filename, source_code=code)
 
-        # Stream nodes + edges as they are parsed
-        parse_outputs = []
-        total_nodes = 0
-        total_edges = 0
+        _push_phase(session, "AST", "Extracting AST nodes...")
+        nodes_vis = []
+        edges_vis = []
+        findings  = []
+        seen_n:  set[str] = set()
+        seen_e:  set[str] = set()
 
-        for file_output in registry.parse_repository_streaming(analysis_dir):
-            parse_outputs.append(file_output)
-            # Stream each node immediately
-            for node in file_output.nodes:
-                label  = node.security_label.value if hasattr(node.security_label, "value") else "NONE"
-                colour = _LABEL_COLOUR.get(label, "#6b7280")
-                _push_to_ws(gq, "node", {
-                    "id":          node.node_id,
-                    "label":       _short_label(node),
-                    "color":       {"background": colour, "border": _darken(colour)},
-                    "shape":       "dot" if label == "NONE" else "diamond",
-                    "size":        8 if label == "NONE" else 14,
-                    "group":       node.node_type.value if hasattr(node.node_type, "value") else "",
-                    "meta": {
-                        "file_path":      node.file_path,
-                        "start_line":     node.start_line,
-                        "node_type":      node.node_type.value if hasattr(node.node_type, "value") else "",
-                        "security_label": label,
-                        "cwe_hints":      list(node.cwe_hints or []),
-                        "raw_text":       (node.raw_text or "")[:300],
-                        "backend":        file_output.metadata.backend.value,
-                    },
-                })
-                total_nodes += 1
+        backend_val = result.metadata.backend.value if hasattr(result.metadata.backend, "value") else ""
 
-            # Stream each edge
-            for edge in file_output.edges:
-                etype  = edge.edge_type.value if hasattr(edge.edge_type, "value") else str(edge.edge_type)
-                colour = _EDGE_COLOUR.get(etype, "#94a3b8")
-                _push_to_ws(gq, "edge", {
-                    "id":     edge.edge_id,
-                    "from":   edge.src_id,
-                    "to":     edge.dst_id,
-                    "label":  etype,
-                    "color":  {"color": colour, "highlight": colour},
-                    "width":  2 if "DFG" in etype or "TAINT" in etype else 1,
-                    "dashes": "CFG" in etype,
-                    "arrows": "to",
-                })
-                total_edges += 1
+        for n in result.nodes[:_VIS_MAX_NODES]:
+            nid = getattr(n, "node_id", "")
+            if nid in seen_n: continue
+            seen_n.add(nid)
+            vis = _serialise_node(n, backend_val)
+            nodes_vis.append(vis)
+            _push_node(session, vis)
 
-        push(
-            f"  ✅ {len(parse_outputs)} files — {total_nodes} nodes, {total_edges} edges",
-            "info", "parsing",
-        )
-        push_progress("parsing", 70)
+            f = _serialise_finding(n, session["session_id"])
+            if f:
+                findings.append(f)
+                _push_annotation(session, nid, f["severity"])
+                _push_finding(session, f)
 
-        # ── Stage 5: Findings extraction ──────────────────────────────────────
-        push("📊 Stage 5 — Vulnerability analysis + annotation", "info", "graph")
-        ws_phase("ANNOTATE", "Detecting vulnerabilities…")
+        _push_phase(session, "CFG", "Building control flow...")
+        for e in result.edges[:_VIS_MAX_EDGES]:
+            eid = getattr(e, "edge_id", "")
+            if eid in seen_e: continue
+            src = getattr(e, "src_id", "")
+            dst = getattr(e, "dst_id", "")
+            if src not in seen_n or dst not in seen_n: continue
+            seen_e.add(eid)
+            vis = _serialise_edge(e)
+            edges_vis.append(vis)
+            _push_edge(session, vis)
 
-        findings = _extract_findings(parse_outputs)
+        _push_phase(session, "ANNOTATE", "Annotating security labels...")
+        _push_phase(session, "COMPLETE", "Analysis complete")
 
-        # Annotate nodes with findings via WS
-        for f in findings:
-            _push_to_ws(gq, "annotation", {
-                "node_id":  f["node_id"],
-                "annotated": True,
-                "severity":  _severity_from_label(f["label"]),
-                "vuln_id":   f.get("rule_id", ""),
-            })
-            _push_to_ws(gq, "finding", f)
-
-        push(f"  ✅ {len(findings)} vulnerability findings", "info", "graph")
-        push_progress("graph", 90)
-
-        # ── Build full graph payload for /api/session/<id>/graph ──────────────
-        graph_payload = _build_graph_payload(parse_outputs)
-        session["graph"]    = graph_payload
+        session["graph"] = {
+            "nodes": nodes_vis, "edges": edges_vis,
+            "summary": {
+                "node_count": len(nodes_vis),
+                "edge_count": len(edges_vis),
+                "finding_count": len(findings),
+            }
+        }
         session["findings"] = findings
         session["status"]   = "complete"
+        session["total_files"] = 1
 
-        push(f"🎉 Analysis complete — {len(findings)} findings", "info", "done")
-        push_progress("done", 100)
-
-        _push_to_ws(gq, "complete", {
-            "node_count":    total_nodes,
-            "edge_count":    total_edges,
-            "finding_count": len(findings),
+        session["graph_queue"].put_nowait({
+            "type": "complete",
+            "payload": {
+                "node_count":    len(nodes_vis),
+                "edge_count":    len(edges_vis),
+                "finding_count": len(findings),
+            },
         })
 
     except Exception as exc:
-        logger.exception("Pipeline exception in session %s", session_id)
-        push(f"❌ Pipeline exception: {exc}", "error", "exception")
-        session["error"]  = str(exc)
+        log.exception("Inline pipeline error")
         session["status"] = "failed"
-        _push_to_ws(gq, "error", {"message": str(exc)})
-
-    finally:
-        prism_root.removeHandler(handler)
-        # Clean up clone dir to free disk space
-        try:
-            if "sandbox_clone_dir" in dir():
-                shutil.rmtree(sandbox_clone_dir, ignore_errors=True)
-        except Exception:
-            pass
+        session["error"]  = str(exc)
+        session["graph_queue"].put_nowait({"type": "error", "payload": {"message": str(exc)}})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Graph payload builder
-# ─────────────────────────────────────────────────────────────────────────────
+def _run_demo_pipeline(session: dict, repo_url: str) -> None:
+    """Minimal demo when real pipeline is not available."""
+    import random
+    session["status"] = "running"
 
-_LABEL_COLOUR = {
-    "SOURCE":     "#3b82f6",
-    "SINK":       "#ef4444",
-    "SANITIZER":  "#22c55e",
-    "SENSITIVE":  "#f59e0b",
-    "PROPAGATOR": "#8b5cf6",
-    "NONE":       "#6b7280",
-}
-_EDGE_COLOUR = {
-    "AST_CHILD":      "#d1d5db",
-    "CFG_NEXT":       "#60a5fa",
-    "CFG_TRUE":       "#34d399",
-    "CFG_FALSE":      "#f87171",
-    "CFG_LOOP":       "#a78bfa",
-    "DFG_FLOW":       "#fb923c",
-    "DFG_DEPENDS":    "#fbbf24",
-    "DFG_KILLS":      "#e879f9",
-    "CALLS":          "#94a3b8",
-    "TAINT_SOURCE":   "#2563eb",
-    "TAINT_SINK":     "#dc2626",
-    "SANITIZER_EDGE": "#16a34a",
-}
+    stages = [
+        ("PARSE",      "Initialising..."),
+        ("AST",        "Parsing source files..."),
+        ("NORMALIZE",  "Normalizing AST..."),
+        ("CFG",        "Building control flow graph..."),
+        ("DFG",        "Building data flow graph..."),
+        ("CPG_MERGE",  "Assembling Code Property Graph..."),
+        ("GRAPHCODEBERT", "Running GraphCodeBERT inference..."),
+        ("ANNOTATE",   "Annotating vulnerability findings..."),
+        ("COMPLETE",   "Analysis complete"),
+    ]
 
-_VIS_MAX_NODES = 600
-_VIS_MAX_EDGES = 1200
+    demo_nodes = []
+    demo_edges = []
 
-_SEV_MAP = {
-    "SINK":      "HIGH",
-    "SOURCE":    "MEDIUM",
-    "SENSITIVE": "MEDIUM",
-    "SANITIZER": "LOW",
-    "NONE":      None,
-}
+    for stage, label in stages:
+        _push_phase(session, stage, label)
+        time.sleep(0.3)
 
+        if stage == "AST":
+            for i in range(15):
+                node = {
+                    "id": f"demo_n_{i}",
+                    "label": f"func_{i}" if i % 3 == 0 else f"call_{i}",
+                    "color": {"background": "#6b7280" if i % 3 else "#ef4444"},
+                    "meta": {
+                        "file_path": "demo.py",
+                        "start_line": i * 5 + 1,
+                        "node_type": "FUNCTION" if i % 3 == 0 else "CALL",
+                        "security_label": "NONE" if i % 3 else "SINK",
+                        "cwe_hints": ["CWE-89"] if i % 7 == 0 else [],
+                    },
+                }
+                demo_nodes.append(node)
+                _push_node(session, node)
 
-def _severity_from_label(label: str) -> str | None:
-    return _SEV_MAP.get(label)
+        if stage == "CFG":
+            for i in range(10):
+                edge = {
+                    "id": f"demo_e_{i}",
+                    "from": f"demo_n_{i}",
+                    "to":   f"demo_n_{i+1}",
+                    "label": "CFG_NEXT",
+                    "color": {"color": "#60a5fa"},
+                }
+                demo_edges.append(edge)
+                _push_edge(session, edge)
 
-
-def _build_graph_payload(parse_outputs: list) -> dict:
-    all_nodes: list[dict] = []
-    all_edges: list[dict] = []
-    seen_nodes: set[str]  = set()
-    seen_edges: set[str]  = set()
-    cwe_counts: dict[str, int] = {}
-    backend_counts: dict[str, int] = {}
-
-    for output in parse_outputs:
-        backend = output.metadata.backend.value
-        backend_counts[backend] = backend_counts.get(backend, 0) + 1
-
-        for node in output.nodes:
-            if node.node_id in seen_nodes or len(all_nodes) >= _VIS_MAX_NODES:
-                continue
-            seen_nodes.add(node.node_id)
-            label  = node.security_label.value if hasattr(node.security_label, "value") else "NONE"
-            colour = _LABEL_COLOUR.get(label, "#6b7280")
-
-            all_nodes.append({
-                "id":    node.node_id,
-                "label": _short_label(node),
-                "title": _node_tooltip(node),
-                "color": {"background": colour, "border": _darken(colour)},
-                "group": node.node_type.value if hasattr(node.node_type, "value") else "",
-                "shape": "dot" if label == "NONE" else "diamond",
-                "size":  8 if label == "NONE" else 14,
-                "meta": {
-                    "file_path":      node.file_path,
-                    "start_line":     node.start_line,
-                    "node_type":      node.node_type.value if hasattr(node.node_type, "value") else "",
-                    "security_label": label,
-                    "cwe_hints":      list(node.cwe_hints or []),
-                    "raw_text":       (node.raw_text or "")[:300],
-                    "backend":        backend,
+        if stage == "ANNOTATE":
+            findings = [
+                {
+                    "node_id":     "demo_n_0",
+                    "session_id":  session["session_id"],
+                    "file_path":   "demo.py",
+                    "start_line":  12,
+                    "node_type":   "CALL",
+                    "name":        "cursor.execute",
+                    "label":       "SINK",
+                    "severity":    "HIGH",
+                    "confidence":  0.91,
+                    "cwe_hints":   ["CWE-89"],
+                    "description": "User-controlled data flows into a SQL query without parameterisation.",
+                    "remediation": "Use parameterised queries.",
+                    "references":  ["https://cwe.mitre.org/data/definitions/89.html"],
                 },
-            })
-            for cwe in (node.cwe_hints or []):
-                cwe_counts[cwe] = cwe_counts.get(cwe, 0) + 1
-
-        for edge in output.edges:
-            if edge.edge_id in seen_edges or len(all_edges) >= _VIS_MAX_EDGES:
-                continue
-            if edge.src_id not in seen_nodes or edge.dst_id not in seen_nodes:
-                continue
-            seen_edges.add(edge.edge_id)
-            etype  = edge.edge_type.value if hasattr(edge.edge_type, "value") else str(edge.edge_type)
-            colour = _EDGE_COLOUR.get(etype, "#94a3b8")
-            all_edges.append({
-                "id":     edge.edge_id,
-                "from":   edge.src_id,
-                "to":     edge.dst_id,
-                "label":  etype,
-                "color":  {"color": colour, "highlight": colour},
-                "width":  2 if "DFG" in etype or "TAINT" in etype else 1,
-                "dashes": "CFG" in etype,
-                "arrows": "to",
-            })
-
-    return {
-        "nodes": all_nodes,
-        "edges": all_edges,
-        "summary": {
-            "node_count":     len(all_nodes),
-            "edge_count":     len(all_edges),
-            "cwe_counts":     cwe_counts,
-            "backend_counts": backend_counts,
-            "truncated":      len(seen_nodes) >= _VIS_MAX_NODES,
-        },
-    }
-
-
-def _extract_findings(parse_outputs: list) -> list[dict]:
-    """
-    Build the rich finding dicts that drive the findings panel.
-    Each finding includes: location, CWE, confidence, code snippet,
-    description, remediation, and OWASP/CWE reference links.
-    """
-    # Vuln metadata lookup keyed by rule_id / CWE
-    _VULN_META = {
-        "CWE-89":  {
-            "description": "User-controlled data flows into a database query without parameterisation. An attacker can alter the query structure to read, modify, or delete data.",
-            "remediation": "Use parameterised queries or an ORM. Never concatenate user input into SQL strings.",
-            "references": ["https://owasp.org/www-community/attacks/SQL_Injection", "https://cwe.mitre.org/data/definitions/89.html"],
-        },
-        "CWE-78":  {
-            "description": "Unsanitised input is passed to a shell command. An attacker can inject arbitrary OS commands.",
-            "remediation": "Use subprocess with a list argument and shell=False. Validate and sanitise all inputs.",
-            "references": ["https://owasp.org/www-community/attacks/Command_Injection", "https://cwe.mitre.org/data/definitions/78.html"],
-        },
-        "CWE-22":  {
-            "description": "A file path derived from user input is not canonicalised. An attacker can escape the intended directory.",
-            "remediation": "Use os.path.realpath() and validate the result is within the expected base directory.",
-            "references": ["https://owasp.org/www-community/attacks/Path_Traversal", "https://cwe.mitre.org/data/definitions/22.html"],
-        },
-        "CWE-502": {
-            "description": "Untrusted data is deserialised without validation. An attacker can craft a payload that executes arbitrary code.",
-            "remediation": "Use safe formats (JSON/YAML safe_load). Never deserialise untrusted data with pickle/marshal.",
-            "references": ["https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data", "https://cwe.mitre.org/data/definitions/502.html"],
-        },
-        "CWE-798": {
-            "description": "A credential or secret key is hardcoded in source code. Anyone with repository access can extract the secret.",
-            "remediation": "Load secrets from environment variables or a secrets manager such as HashiCorp Vault.",
-            "references": ["https://cwe.mitre.org/data/definitions/798.html"],
-        },
-        "CWE-79":  {
-            "description": "User-supplied data is rendered in an HTML context without escaping. An attacker can execute arbitrary JavaScript in a victim's browser.",
-            "remediation": "Escape all user input before DOM insertion. Use framework-provided safe rendering (React JSX, Jinja2 autoescaping).",
-            "references": ["https://owasp.org/www-community/attacks/xss/", "https://cwe.mitre.org/data/definitions/79.html"],
-        },
-        "CWE-306": {
-            "description": "An endpoint or sensitive function lacks an authentication check. Unauthenticated users may access protected resources.",
-            "remediation": "Apply @login_required, JWT verification, or equivalent middleware to all protected routes.",
-            "references": ["https://cwe.mitre.org/data/definitions/306.html"],
-        },
-    }
-
-    findings: list[dict] = []
-    for output in parse_outputs:
-        for node in output.nodes:
-            label = node.security_label.value if hasattr(node.security_label, "value") else ""
-            if label not in ("SINK", "SOURCE", "SENSITIVE"):
-                continue
-            if node.security_confidence < 0.3:
-                continue
-
-            cwes     = list(node.cwe_hints or [])
-            cwe_key  = cwes[0] if cwes else ""
-            meta     = _VULN_META.get(cwe_key, {})
-            attrs    = node.attributes or {}
-
-            findings.append({
-                "node_id":     node.node_id,
-                "file_path":   node.file_path,
-                "start_line":  node.start_line,
-                "node_type":   node.node_type.value if hasattr(node.node_type, "value") else "",
-                "name":        node.name or "",
-                "label":       label,
-                "severity":    attrs.get("severity") or (_severity_from_label(label) or "INFO"),
-                "confidence":  round(node.security_confidence, 2),
-                "cwe_hints":   cwes,
-                "raw_text":    (node.raw_text or "")[:400],
-                "rule_id":     attrs.get("rule_id", ""),
-                "description": meta.get("description", ""),
-                "remediation": meta.get("remediation", ""),
-                "references":  meta.get("references", []),
-                "function_name": attrs.get("function_name", ""),
-            })
-
-    findings.sort(key=lambda f: (f["label"] != "SINK", -f["confidence"]))
-    return findings
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Demo mode
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _inject_demo_data(session: dict, repo_url: str,
-                      q: queue.Queue, gq: queue.Queue) -> None:
-    """Synthetic pipeline run for UI testing when the pipeline is not installed."""
-    stages_log = [
-        ("🔑 Stage 1 — Credential acquisition", "credential", 12),
-        ("📥 Stage 2 — Repository ingestion (TLS clone + integrity check)", "ingestion", 28),
-        ("  ✅ Commit SHA pinned: a3f7c2d1…", "ingestion", 28),
-        ("  ✅ 42 files ingested, repo_hash=a3f7c2d1…", "ingestion", 30),
-        ("🔒 Stage 3 — gVisor sandbox isolation (runsc container)", "sandbox", 35),
-        ("  ✅ Container exited cleanly", "sandbox", 35),
-        ("🔬 Stage 4 — CPG construction (Joern + Tree-sitter)", "parsing", 40),
-        ("  Backend routing: Joern → Python/Java, Tree-sitter → Rust/HCL", "parsing", 55),
-        ("  ✅ 42 files — 1,847 nodes, 3,209 edges", "parsing", 70),
-        ("📊 Stage 5 — Vulnerability analysis", "graph", 80),
-        ("  ✅ 3 SINK nodes found (CWE-89, CWE-78, CWE-22)", "graph", 90),
-        ("🎉 Analysis complete — 3 vulnerability findings", "done", 100),
-    ]
-    for msg, stage, pct in stages_log:
-        time.sleep(0.35)
-        q.put_nowait({"type": "log", "level": "info", "logger": "prism.ui.demo",
-                      "message": msg, "stage": stage, "ts": round(time.time() * 1000)})
-        q.put_nowait({"type": "progress", "stage": stage, "pct": pct})
-
-    # Stream demo nodes with small delays
-    demo_nodes = [
-        ("n1", "main()\n(FUNCTION)",         "#6b7280",  "dot",     8,  "FUNCTION",  "NONE",      [],          "src/app.py",    1,  "def main():", "joern"),
-        ("n2", "request.args\n(SOURCE)",      "#3b82f6",  "diamond", 14, "IDENTIFIER","SOURCE",    [],          "src/app.py",    12, "user_id = request.args.get('id', '')", "joern"),
-        ("n3", "query\n(ASSIGN)",             "#6b7280",  "dot",     8,  "ASSIGN",    "NONE",      [],          "src/app.py",    13, 'query = "SELECT * FROM users WHERE id=" + user_id', "joern"),
-        ("n4", "db.execute\n(SINK)",          "#ef4444",  "diamond", 14, "CALL",      "SINK",      ["CWE-89"],  "src/app.py",    14, "cursor.execute(query)", "codeql_sarif"),
-        ("n5", "subprocess.run\n(SINK)",      "#ef4444",  "diamond", 14, "CALL",      "SINK",      ["CWE-78"],  "src/utils.py",  7,  "subprocess.run(cmd, shell=True)", "codeql_sarif"),
-        ("n6", "os.environ\n(SENSITIVE)",     "#f59e0b",  "diamond", 14, "IDENTIFIER","SENSITIVE", [],          "src/config.py", 3,  "SECRET = os.environ['DB_PASS']", "tree_sitter"),
-    ]
-    for nid, label, bg, shape, size, ntype, sec_label, cwes, fpath, line, raw, backend in demo_nodes:
-        time.sleep(0.2)
-        _push_to_ws(gq, "node", {
-            "id": nid, "label": label,
-            "color": {"background": bg, "border": _darken(bg)},
-            "shape": shape, "size": size, "group": ntype,
-            "meta": {"file_path": fpath,
-                     "start_line": line, "node_type": ntype,
-                     "security_label": sec_label, "cwe_hints": cwes,
-                     "raw_text": raw, "backend": backend},
-        })
-
-    demo_edges = [
-        ("e1","n1","n2","AST_CHILD","#d1d5db",1,False),
-        ("e2","n2","n3","DFG_FLOW", "#fb923c",2,False),
-        ("e3","n3","n4","DFG_FLOW", "#fb923c",2,False),
-        ("e4","n1","n5","CFG_NEXT", "#60a5fa",1,True),
-    ]
-    for eid, src, dst, etype, colour, width, dashes in demo_edges:
-        time.sleep(0.15)
-        _push_to_ws(gq, "edge", {"id":eid,"from":src,"to":dst,"label":etype,
-                                  "color":{"color":colour},"width":width,
-                                  "dashes":dashes,"arrows":"to"})
-
-    # Findings with full metadata
-    demo_findings = [
-        {
-            "node_id":"n4","file_path":"src/app.py","start_line":14,
-            "node_type":"CALL","name":"cursor.execute","label":"SINK",
-            "severity":"HIGH","confidence":0.95,"cwe_hints":["CWE-89"],
-            "raw_text": "user_id = request.args.get(\"id\", \"\")\nconn = get_db()\ncursor = conn.cursor()\ncursor.execute(\"SELECT * FROM users WHERE id=\" + user_id)",
-            "rule_id":"py/sql-injection","function_name":"get_user",
-            "description":"User-controlled data flows into a database query without parameterisation. An attacker can alter the query structure to read, modify, or delete data.",
-            "remediation":"Use parameterised queries or an ORM. Never concatenate user input into SQL strings.",
-            "references":["https://owasp.org/www-community/attacks/SQL_Injection","https://cwe.mitre.org/data/definitions/89.html"],
-        },
-        {
-            "node_id":"n5","file_path":"src/utils.py","start_line":7,
-            "node_type":"CALL","name":"subprocess.run","label":"SINK",
-            "severity":"HIGH","confidence":0.90,"cwe_hints":["CWE-78"],
-            "raw_text": "cmd = request.args.get('cmd', 'echo hello')\nresult = subprocess.run(cmd, shell=True, capture_output=True)",
-            "rule_id":"py/command-injection","function_name":"run_cmd",
-            "description":"Unsanitised input is passed to a shell command. An attacker can inject arbitrary OS commands.",
-            "remediation":"Use subprocess with a list argument and shell=False. Validate and sanitise all inputs.",
-            "references":["https://owasp.org/www-community/attacks/Command_Injection","https://cwe.mitre.org/data/definitions/78.html"],
-        },
-        {
-            "node_id":"n6","file_path":"src/config.py","start_line":3,
-            "node_type":"IDENTIFIER","name":"os.environ","label":"SENSITIVE",
-            "severity":"MEDIUM","confidence":0.80,"cwe_hints":[],
-            "raw_text": "SECRET = os.environ['DB_PASS']",
-            "rule_id":"","function_name":"",
-            "description":"A credential or secret key is hardcoded in source code. Anyone with repository access can extract the secret.",
-            "remediation":"Load secrets from environment variables or a secrets manager such as HashiCorp Vault.",
-            "references":["https://cwe.mitre.org/data/definitions/798.html"],
-        },
-    ]
-    for f in demo_findings:
-        time.sleep(0.1)
-        _push_to_ws(gq, "annotation", {"node_id": f["node_id"], "annotated": True,
-                                        "severity": f["severity"], "vuln_id": f["rule_id"]})
-        _push_to_ws(gq, "finding", f)
+            ]
+            for f in findings:
+                _push_annotation(session, f["node_id"], f["severity"])
+                _push_finding(session, f)
+            session["findings"] = findings
 
     session["graph"] = {
-        "nodes": [], "edges": [],
-        "summary": {"node_count": 6, "edge_count": 4,
-                    "cwe_counts": {"CWE-89": 1, "CWE-78": 1},
-                    "backend_counts": {"joern": 3, "tree_sitter": 1, "codeql_sarif": 2},
-                    "truncated": False},
+        "nodes": demo_nodes,
+        "edges": demo_edges,
+        "summary": {"node_count": len(demo_nodes), "edge_count": len(demo_edges), "finding_count": 1},
     }
-    session["findings"] = demo_findings
-    _push_to_ws(gq, "complete", {"node_count":6,"edge_count":4,"finding_count":3})
-
-    q.put_nowait({"type":"final","status":"complete",
-                  "findings": demo_findings,
-                  "summary": {"node_count":6,"edge_count":4}})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _short_label(node) -> str:
-    name  = (node.name or "")[:20]
-    ntype = node.node_type.value if hasattr(node.node_type, "value") else ""
-    return f"{name}\n({ntype})" if name else ntype
+    session["status"] = "complete"
+    session["total_files"] = 5
+    session["graph_queue"].put_nowait({
+        "type": "complete",
+        "payload": {"node_count": len(demo_nodes), "edge_count": len(demo_edges), "finding_count": 1},
+    })
 
 
-def _node_tooltip(node) -> str:
-    label = node.security_label.value if hasattr(node.security_label, "value") else ""
-    cwes  = ", ".join(node.cwe_hints) if node.cwe_hints else "—"
-    colour = "red" if label == "SINK" else "blue"
-    return (
-        f"<b>{node.name or node.node_id[:12]}</b><br>"
-        f"Type: {node.node_type.value if hasattr(node.node_type,'value') else ''}<br>"
-        f"File: {Path(node.file_path).name}:{node.start_line}<br>"
-        f"Label: <b style='color:{colour}'>{label}</b><br>"
-        f"CWE: {cwes}<br>"
-        f"Confidence: {node.security_confidence:.0%}"
-    )
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_session(session_id: str) -> dict:
+    s = _sessions.get(session_id)
+    if not s:
+        from flask import abort
+        abort(404, description=f"Session '{session_id}' not found")
+    return s
 
 
-def _darken(hex_colour: str) -> str:
-    h = hex_colour.lstrip("#")
-    if len(h) != 6:
-        return hex_colour
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"#{max(0,r-40):02x}{max(0,g-40):02x}{max(0,b-40):02x}"
+def _build_hitl_summary(s: dict) -> dict:
+    findings = s.get("findings", [])
+    cwe_counts: dict[str, int] = {}
+    for f in findings:
+        for cwe in (f.get("cwe_hints") or []):
+            cwe_counts[cwe] = cwe_counts.get(cwe, 0) + 1
+
+    graph = s.get("graph", {})
+    summary = graph.get("summary", {})
+
+    return {
+        "cpg_nodes":      summary.get("node_count", 0),
+        "cpg_edges":      summary.get("edge_count", 0),
+        "finding_count":  len(findings),
+        "high_severity":  sum(1 for f in findings if f.get("severity") == "HIGH"),
+        "medium_severity":sum(1 for f in findings if f.get("severity") == "MEDIUM"),
+        "top_cwes":       dict(sorted(cwe_counts.items(), key=lambda x: -x[1])[:5]),
+        "stage_results":  s.get("stage_results", []),
+        "tool_status":    s.get("tool_status", {}),
+    }
 
 
-def _check_vault() -> bool:
+def _compute_metrics(s: dict) -> dict:
+    """Compute real-time performance metrics from session data."""
+    findings = s.get("findings", [])
+    graph    = s.get("graph", {})
+    summary  = graph.get("summary", {})
+    elapsed  = time.time() - s.get("started_at", time.time())
+
+    total_files = s.get("total_files", 0) or 0
+    total_nodes = summary.get("node_count", 0)
+    total_edges = summary.get("edge_count", 0)
+
+    # Graph density
+    density = 0.0
+    if total_nodes > 1:
+        density = round(total_edges / (total_nodes * (total_nodes - 1) / 2), 6)
+
+    # CWE breakdown
+    cwe_counts: dict[str, int] = {}
+    severity_conf: dict[str, list[float]] = {}
+    for f in findings:
+        sev = f.get("severity", "UNKNOWN")
+        conf = float(f.get("confidence", 0.0))
+        severity_conf.setdefault(sev, []).append(conf)
+        for cwe in (f.get("cwe_hints") or []):
+            cwe_counts[cwe] = cwe_counts.get(cwe, 0) + 1
+
+    # Stage latencies
+    stage_latencies = {}
+    for sr in s.get("stage_results", []):
+        if isinstance(sr, dict):
+            stage_latencies[sr.get("stage", "?")] = sr.get("duration_ms", 0)
+
+    # Memory usage
+    memory_mb = 0.0
     try:
-        import urllib.request
-        addr = os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
-        with urllib.request.urlopen(f"{addr}/v1/sys/health", timeout=1) as r:
-            return r.status in (200, 429, 472, 473, 501, 503)
+        import psutil, os as _os
+        proc = psutil.Process(_os.getpid())
+        memory_mb = round(proc.memory_info().rss / (1024 * 1024), 1)
     except Exception:
-        return False
+        pass
+
+    return {
+        "session_id":       s.get("session_id", ""),
+        "status":           s.get("status", "unknown"),
+        "elapsed_s":        round(elapsed, 1),
+        "total_files":      total_files,
+        "total_nodes":      total_nodes,
+        "total_edges":      total_edges,
+        "finding_count":    len(findings),
+        "high_severity":    sum(1 for f in findings if f.get("severity") == "HIGH"),
+        "medium_severity":  sum(1 for f in findings if f.get("severity") == "MEDIUM"),
+        "low_severity":     sum(1 for f in findings if f.get("severity") == "LOW"),
+        "graph_density":    density,
+        "files_per_second": round(total_files / elapsed, 2) if elapsed > 0 else 0,
+        "nodes_per_second": round(total_nodes / elapsed, 2) if elapsed > 0 else 0,
+        "cwe_breakdown":    dict(sorted(cwe_counts.items(), key=lambda x: -x[1])[:10]),
+        "stage_latencies":  stage_latencies,
+        "memory_mb":        memory_mb,
+        "hitl_state":       s.get("hitl_state", "not_reached"),
+        "backend_breakdown":s.get("backend_breakdown", {}),
+        "avg_confidence": {
+            sev: round(sum(confs) / len(confs), 3)
+            for sev, confs in severity_conf.items() if confs
+        },
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ── gVisor sandbox helper ─────────────────────────────────────────────────────
+
+def run_in_gvisor_sandbox(repo_dir: str, session_id: str, push_fn, push_progress_fn) -> str:
+    """
+    Isolate the repo in a gVisor (runsc) Docker container.
+    Falls back to standard Docker if gVisor is not available.
+    Falls back to direct analysis if Docker is not available.
+    """
+    import shutil as _shutil
+    output_dir = tempfile.mkdtemp(prefix=f"prism_out_{session_id[:8]}_")
+
+    if not _shutil.which("docker"):
+        push_fn("⚠️ Docker not found — running on host directly", "warning", "sandbox")
+        return repo_dir
+
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        use_gvisor = "runsc" in result.stdout
+    except Exception:
+        use_gvisor = False
+
+    runtime_flags = ["--runtime=runsc"] if use_gvisor else []
+    runtime_label = "gVisor (runsc)" if use_gvisor else "standard Docker"
+    push_fn(f"🔒 Sandbox: {runtime_label}", "info", "sandbox")
+
+    container = f"prism-sandbox-{session_id[:12]}"
+    cmd = [
+        "docker", "run", "--name", container, "--rm",
+        *runtime_flags,
+        "--network=none", "--read-only",
+        "--tmpfs", "/tmp:size=256m",
+        f"--volume={repo_dir}:/workspace:ro",
+        f"--volume={output_dir}:/output:rw",
+        "--memory=512m", "--cpus=1", "--user=nobody",
+        "python:3.11-slim", "python3", "-c",
+        "import shutil; shutil.copytree('/workspace','/output/repo',dirs_exist_ok=True); print('ok')",
+    ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode == 0 and "ok" in res.stdout:
+            push_progress_fn("sandbox", 35)
+            return os.path.join(output_dir, "repo")
+        push_fn(f"⚠️ Sandbox exit {res.returncode} — falling back", "warning", "sandbox")
+        return repo_dir
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        push_fn("⚠️ Sandbox timeout — falling back", "warning", "sandbox")
+        return repo_dir
+    except Exception as exc:
+        push_fn(f"⚠️ Sandbox error ({exc}) — falling back", "warning", "sandbox")
+        return repo_dir
+
+
 if __name__ == "__main__":
-    import uvicorn
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    )
-    port = int(os.environ.get("PRISM_UI_PORT", 5001))
-    print(f"\n  PRISM Dashboard  →  http://localhost:{port}\n")
-    print(f"  gVisor available: {_gvisor_available()}")
-    print(f"  Pipeline available: {_PIPELINE_AVAILABLE}\n")
-    uvicorn.run("ui.app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    port  = int(os.environ.get("PORT", 5001))
+    debug = os.environ.get("DEBUG", "false").lower() == "true"
+    log.info("PRISM UI starting on http://0.0.0.0:%d  debug=%s", port, debug)
+    app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)

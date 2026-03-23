@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>PRISM — Confidential Code Analysis</title>
+
+<!-- vis.js for CPG network graph -->
+<script src="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js"></script>
+<link  href="https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.css" rel="stylesheet"/>
+
+<!-- Chart.js for live metrics -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+
+<style>
+/* ── Reset & typography ────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:      #0d1117;  --bg2:  #161b22;  --bg3:   #21262d;
+  --border:  #30363d;  --text: #e6edf3;  --muted: #8b949e;
+  --accent:  #2563eb;  --ok:   #22c55e;  --warn:  #f59e0b;
+  --danger:  #ef4444;  --info: #60a5fa;
+  --font: 'Segoe UI', system-ui, sans-serif;
+  --mono: 'Cascadia Code', 'Fira Code', monospace;
+  --radius: 8px;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+
+/* ── Layout ─────────────────────────────────────────────────────────── */
+#app  { display: grid; grid-template-rows: 52px 1fr; height: 100vh; }
+#main { display: grid; grid-template-columns: 340px 1fr 320px; gap: 0; overflow: hidden; }
+
+/* ── Header ─────────────────────────────────────────────────────────── */
+#header {
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 20px; gap: 16px;
+}
+.logo { font-weight: 700; font-size: 18px; color: var(--accent); letter-spacing: 1px; }
+.logo span { color: var(--text); }
+#session-badge {
+  font-size: 11px; color: var(--muted); font-family: var(--mono);
+  padding: 2px 8px; background: var(--bg3); border-radius: 12px;
+  max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ml-auto { margin-left: auto; }
+.status-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--muted); margin-right: 6px;
+}
+.status-dot.running { background: var(--warn); animation: pulse 1s infinite; }
+.status-dot.complete{ background: var(--ok); }
+.status-dot.failed  { background: var(--danger); }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+
+/* ── Panels ─────────────────────────────────────────────────────────── */
+.panel {
+  background: var(--bg2); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.panel-header {
+  padding: 10px 14px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
+  border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px;
+}
+.panel-body { flex: 1; overflow-y: auto; padding: 12px; }
+
+/* ── Input form ─────────────────────────────────────────────────────── */
+#input-panel { border-right: 1px solid var(--border); }
+.field { margin-bottom: 10px; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+input[type=text], input[type=password], select, textarea {
+  width: 100%; padding: 7px 10px; background: var(--bg3);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-family: var(--mono); font-size: 12px;
+  outline: none; transition: border-color .2s;
+}
+input:focus, textarea:focus { border-color: var(--accent); }
+textarea { resize: vertical; height: 100px; }
+.tabs { display: flex; gap: 2px; margin-bottom: 12px; }
+.tab {
+  flex: 1; padding: 6px; text-align: center; font-size: 12px;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 6px;
+  cursor: pointer; color: var(--muted); transition: all .2s;
+}
+.tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border-radius: var(--radius); border: none;
+  font-size: 13px; font-weight: 600; cursor: pointer; transition: all .2s;
+}
+.btn-primary { background: var(--accent); color: #fff; width: 100%; justify-content: center; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-approve { background: var(--ok); color: #fff; width: 100%; justify-content: center; margin-bottom: 6px; }
+.btn-reject  { background: var(--danger); color: #fff; width: 100%; justify-content: center; }
+
+/* ── Stage progress bar ──────────────────────────────────────────────── */
+#stage-bar {
+  padding: 8px 12px; background: var(--bg3); border-bottom: 1px solid var(--border);
+  display: flex; gap: 4px; flex-wrap: wrap;
+}
+.stage-dot {
+  font-size: 10px; padding: 2px 8px; border-radius: 12px;
+  background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+  transition: all .3s;
+}
+.stage-dot.running { background: #1e3a5f; border-color: var(--info); color: var(--info); }
+.stage-dot.ok      { background: #0f2a1a; border-color: var(--ok);   color: var(--ok); }
+.stage-dot.failed  { background: #2a0f0f; border-color: var(--danger); color: var(--danger); }
+
+/* ── CPG Graph ──────────────────────────────────────────────────────── */
+#graph-panel { display: flex; flex-direction: column; }
+#graph-toolbar {
+  padding: 6px 10px; background: var(--bg3); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.graph-stat {
+  font-size: 11px; color: var(--muted); padding: 2px 8px;
+  background: var(--bg2); border-radius: 10px; border: 1px solid var(--border);
+}
+.graph-stat strong { color: var(--text); }
+#graph-container { flex: 1; position: relative; }
+#cpg-network { width: 100%; height: 100%; }
+#graph-legend {
+  position: absolute; bottom: 12px; left: 12px;
+  background: rgba(13,17,23,.85); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px; font-size: 11px;
+  display: flex; gap: 10px; flex-wrap: wrap;
+}
+.legend-item { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.legend-dot  { width: 10px; height: 10px; border-radius: 50%; }
+
+/* ── Right panel — findings + metrics ──────────────────────────────── */
+#right-panel { border-left: 1px solid var(--border); border-right: none; }
+.tabs-sm { display: flex; border-bottom: 1px solid var(--border); }
+.tab-sm {
+  flex: 1; padding: 8px 4px; text-align: center; font-size: 11px;
+  cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
+  transition: all .2s;
+}
+.tab-sm.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-sm-body { display: none; }
+.tab-sm-body.active { display: block; }
+
+/* ── Finding cards ──────────────────────────────────────────────────── */
+.finding-card {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px; margin-bottom: 8px; cursor: pointer;
+  transition: border-color .2s;
+}
+.finding-card:hover { border-color: var(--accent); }
+.finding-card.expanded { border-color: var(--accent); }
+.finding-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.severity-badge {
+  font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+}
+.severity-badge.HIGH   { background: #3d1a1a; color: var(--danger); }
+.severity-badge.MEDIUM { background: #3d2a0f; color: var(--warn); }
+.severity-badge.LOW    { background: #1a2a3d; color: var(--info); }
+.finding-type { font-weight: 600; font-size: 12px; }
+.finding-cwe  { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+.finding-loc  { font-size: 11px; color: var(--muted); }
+.finding-detail { margin-top: 8px; display: none; }
+.finding-detail.open { display: block; }
+.finding-desc { font-size: 12px; color: var(--muted); line-height: 1.5; margin-bottom: 6px; }
+.finding-remediation {
+  font-size: 11px; padding: 6px 8px;
+  background: #0f2a1a; border-left: 3px solid var(--ok);
+  border-radius: 0 4px 4px 0; color: var(--ok);
+}
+.finding-snippet {
+  font-family: var(--mono); font-size: 11px; padding: 6px 8px;
+  background: var(--bg); border-radius: 4px; margin-top: 6px;
+  overflow-x: auto; white-space: pre; max-height: 80px;
+}
+.confidence-bar {
+  height: 3px; background: var(--bg); border-radius: 2px; margin-top: 4px;
+}
+.confidence-fill {
+  height: 100%; border-radius: 2px; background: var(--ok);
+  transition: width .3s;
+}
+
+/* ── Metrics panel ──────────────────────────────────────────────────── */
+.metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+.metric-card {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px; text-align: center;
+}
+.metric-value { font-size: 20px; font-weight: 700; color: var(--accent); }
+.metric-label { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.chart-container { position: relative; height: 120px; margin-bottom: 10px; }
+.stage-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.stage-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.stage-table td:last-child { text-align: right; color: var(--muted); font-family: var(--mono); }
+
+/* ── HITL panel ─────────────────────────────────────────────────────── */
+#hitl-overlay {
+  display: none; position: absolute; inset: 0; z-index: 100;
+  background: rgba(0,0,0,.7); align-items: center; justify-content: center;
+}
+#hitl-overlay.show { display: flex; }
+#hitl-modal {
+  background: var(--bg2); border: 1px solid var(--warn); border-radius: 12px;
+  padding: 24px; width: 480px; max-width: 90vw;
+}
+#hitl-modal h2 { font-size: 16px; color: var(--warn); margin-bottom: 12px; }
+.hitl-summary { background: var(--bg3); border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+.hitl-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+.hitl-row span:first-child { color: var(--muted); }
+.hitl-row span:last-child  { font-weight: 600; color: var(--text); }
+.hitl-cwe { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+.cwe-pill {
+  font-size: 10px; padding: 1px 6px; border-radius: 10px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+  font-family: var(--mono);
+}
+.hitl-actions { display: flex; flex-direction: column; gap: 6px; }
+
+/* ── Log console ────────────────────────────────────────────────────── */
+#log-console {
+  background: var(--bg); border-top: 1px solid var(--border);
+  height: 120px; overflow-y: auto; padding: 8px 12px;
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+}
+.log-line { padding: 1px 0; line-height: 1.5; }
+.log-line.error { color: var(--danger); }
+.log-line.warn  { color: var(--warn); }
+.log-line.info  { color: var(--muted); }
+
+/* ── Scrollbar ──────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- HEADER -->
+<header id="header">
+  <span class="logo">PRI<span>SM</span></span>
+  <span id="session-badge">No active session</span>
+  <div id="pipeline-status" style="display:flex;align-items:center;font-size:12px;color:var(--muted)">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">Idle</span>
+  </div>
+  <div class="ml-auto" style="display:flex;gap:8px;align-items:center">
+    <span id="node-count-badge"  class="graph-stat">Nodes <strong id="hdr-nodes">0</strong></span>
+    <span id="edge-count-badge"  class="graph-stat">Edges <strong id="hdr-edges">0</strong></span>
+    <span id="finding-count-badge" class="graph-stat">Findings <strong id="hdr-findings">0</strong></span>
+  </div>
+</header>
+
+<div id="main">
+
+<!-- LEFT PANEL — Input form -->
+<aside class="panel" id="input-panel">
+  <div class="panel-header">🔬 Analysis Target</div>
+  <div class="panel-body">
+
+    <div class="tabs">
+      <div class="tab active" data-tab="repo" onclick="switchTab('repo')">Repository</div>
+      <div class="tab" data-tab="inline" onclick="switchTab('inline')">Inline Code</div>
+    </div>
+
+    <!-- Repository tab -->
+    <div class="tab-content active" id="tab-repo">
+      <div class="field">
+        <label>GitHub Repository URL</label>
+        <input type="text" id="repo-url" placeholder="https://github.com/owner/repo" value=""/>
+      </div>
+      <div class="field">
+        <label>Branch</label>
+        <input type="text" id="repo-branch" value="main"/>
+      </div>
+      <div class="field">
+        <label>Commit SHA <span style="color:var(--muted)">(optional, pins analysis)</span></label>
+        <input type="text" id="repo-sha" placeholder="Leave blank for HEAD"/>
+      </div>
+      <div class="field">
+        <label>GitHub PAT <span style="color:var(--muted)">(or set PRISM_GIT_TOKEN)</span></label>
+        <input type="password" id="repo-token" placeholder="github_pat_..."/>
+      </div>
+      <div class="field">
+        <label>Max repo size (MB)</label>
+        <input type="text" id="repo-max-mb" value="100"/>
+      </div>
+    </div>
+
+    <!-- Inline code tab -->
+    <div class="tab-content" id="tab-inline">
+      <div class="field">
+        <label>Language</label>
+        <select id="inline-lang">
+          <option value="python">Python</option>
+          <option value="javascript">JavaScript / TypeScript</option>
+          <option value="java">Java</option>
+          <option value="go">Go</option>
+          <option value="rust">Rust</option>
+          <option value="c">C / C++</option>
+          <option value="terraform">Terraform (HCL)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Filename</label>
+        <input type="text" id="inline-filename" value="snippet.py"/>
+      </div>
+      <div class="field">
+        <label>Source Code</label>
+        <textarea id="inline-code" placeholder="Paste code here...">
+import sqlite3
+
+def get_user(user_id):
+    conn = sqlite3.connect("db.sqlite")
+    cursor = conn.cursor()
+    query = "SELECT * FROM users WHERE id=" + user_id
+    cursor.execute(query)
+    return cursor.fetchall()
+        </textarea>
+      </div>
+    </div>
+
+    <button class="btn btn-primary" onclick="startAnalysis()">
+      ▶ Run PRISM Analysis
+    </button>
+
+    <!-- Stage progress -->
+    <div style="margin-top:14px">
+      <div class="panel-header" style="padding:6px 0;margin-bottom:6px">Pipeline Stages</div>
+      <div id="stage-bar">
+        <span class="stage-dot" data-stage="tool_health_check">Health</span>
+        <span class="stage-dot" data-stage="ingestion">Ingest</span>
+        <span class="stage-dot" data-stage="parsing">Parse</span>
+        <span class="stage-dot" data-stage="cpg_build">CPG</span>
+        <span class="stage-dot" data-stage="codeql_analysis">CodeQL</span>
+        <span class="stage-dot" data-stage="sarif_annotation">SARIF</span>
+        <span class="stage-dot" data-stage="hitl1_checkpoint">HITL</span>
+        <span class="stage-dot" data-stage="emit_audit">Audit</span>
+      </div>
+    </div>
+
+  </div>
+</aside>
+
+<!-- CENTER — CPG Graph -->
+<div id="graph-panel">
+  <div id="graph-toolbar">
+    <span class="graph-stat">Nodes <strong id="stat-nodes">0</strong></span>
+    <span class="graph-stat">Edges <strong id="stat-edges">0</strong></span>
+    <span class="graph-stat">SINK <strong id="stat-sinks" style="color:var(--danger)">0</strong></span>
+    <span class="graph-stat">SOURCE <strong id="stat-sources" style="color:var(--info)">0</strong></span>
+    <span style="flex:1"></span>
+    <button class="btn" style="padding:4px 10px;font-size:11px;background:var(--bg3);border:1px solid var(--border)"
+            onclick="fitGraph()">⊡ Fit</button>
+    <button class="btn" style="padding:4px 10px;font-size:11px;background:var(--bg3);border:1px solid var(--border)"
+            onclick="clearGraph()">✕ Clear</button>
+  </div>
+  <div id="graph-container" style="position:relative;flex:1">
+    <div id="cpg-network"></div>
+    <div id="graph-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);flex-direction:column;gap:12px">
+      <div style="font-size:48px">🔍</div>
+      <div>Start an analysis to see the Code Property Graph</div>
+    </div>
+    <div id="graph-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>SINK</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>SOURCE</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>SANITIZER</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>SENSITIVE</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>NORMAL</div>
+    </div>
+  </div>
+  <!-- Log console -->
+  <div id="log-console"><div class="log-line info">[PRISM] Ready. Start an analysis above.</div></div>
+</div>
+
+<!-- RIGHT PANEL — Findings + Metrics -->
+<aside class="panel" id="right-panel">
+  <div class="tabs-sm">
+    <div class="tab-sm active" onclick="switchRightTab('findings')"   id="rt-findings-tab">Findings</div>
+    <div class="tab-sm" onclick="switchRightTab('metrics')"    id="rt-metrics-tab">Metrics</div>
+    <div class="tab-sm" onclick="switchRightTab('hitl-review')" id="rt-hitl-tab">HITL</div>
+  </div>
+
+  <!-- FINDINGS -->
+  <div class="tab-sm-body active panel-body" id="rt-findings" style="padding:8px">
+    <div id="findings-list">
+      <div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">
+        No findings yet — run an analysis
+      </div>
+    </div>
+  </div>
+
+  <!-- METRICS -->
+  <div class="tab-sm-body panel-body" id="rt-metrics" style="padding:8px">
+    <div class="metric-grid">
+      <div class="metric-card"><div class="metric-value" id="m-nodes">0</div><div class="metric-label">CPG Nodes</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-edges">0</div><div class="metric-label">CPG Edges</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-findings">0</div><div class="metric-label">Findings</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-files">0</div><div class="metric-label">Files</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-density">0.0</div><div class="metric-label">Graph Density</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-fps">0</div><div class="metric-label">Files/sec</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-nps">0</div><div class="metric-label">Nodes/sec</div></div>
+      <div class="metric-card"><div class="metric-value" id="m-mem">0</div><div class="metric-label">Memory MB</div></div>
+    </div>
+
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Severity Breakdown</div>
+    <div class="chart-container"><canvas id="severity-chart"></canvas></div>
+
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">CWE Distribution</div>
+    <div class="chart-container"><canvas id="cwe-chart"></canvas></div>
+
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Stage Latencies (ms)</div>
+    <table class="stage-table" id="stage-latency-table">
+      <tr><td style="color:var(--muted)">Waiting for data...</td></tr>
+    </table>
+  </div>
+
+  <!-- HITL REVIEW -->
+  <div class="tab-sm-body panel-body" id="rt-hitl-review" style="padding:8px">
+    <div id="hitl-review-content">
+      <div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">
+        Pipeline has not reached the HITL checkpoint yet
+      </div>
+    </div>
+  </div>
+
+</aside>
+
+</div><!-- #main -->
+</div><!-- #app -->
+
+<!-- HITL Modal -->
+<div id="hitl-overlay">
+  <div id="hitl-modal">
+    <h2>⚠️ Human-in-the-Loop Review Required</h2>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:12px">
+      Review the CPG analysis results before the audit is emitted.
+    </p>
+    <div class="hitl-summary" id="hitl-summary-content">Loading...</div>
+    <div class="field">
+      <label>Operator name</label>
+      <input type="text" id="hitl-operator" placeholder="your-name"/>
+    </div>
+    <div class="field">
+      <label>Notes (required for rejection)</label>
+      <input type="text" id="hitl-notes" placeholder="Review notes..."/>
+    </div>
+    <div class="hitl-actions">
+      <button class="btn btn-approve" onclick="hitlApprove()">✅ Approve — Emit Audit</button>
+      <button class="btn btn-reject"  onclick="hitlReject()">❌ Reject — Terminate Pipeline</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// =============================================================================
+// PRISM Frontend — complete implementation
+// =============================================================================
+
+let sessionId     = null;
+let eventSource   = null;
+let network       = null;
+let nodeDataSet   = null;
+let edgeDataSet   = null;
+let severityChart = null;
+let cweChart      = null;
+let activeTab     = 'repo';
+let nodeCount     = 0;
+let edgeCount     = 0;
+let sinkCount     = 0;
+let sourceCount   = 0;
+let findings      = [];
+let metrics       = {};
+
+const STAGE_MAP = {
+  'tool_health_check': 'Health',
+  'ingestion':         'Ingest',
+  'parsing':           'Parse',
+  'cpg_build':         'CPG',
+  'codeql_analysis':   'CodeQL',
+  'sarif_annotation':  'SARIF',
+  'hitl1_checkpoint':  'HITL',
+  'emit_audit':        'Audit',
+  // Also accept phase names
+  'PARSE': 'Parse', 'AST': 'AST', 'NORMALIZE': 'Normalize',
+  'CFG': 'CFG', 'DFG': 'DFG', 'CPG_MERGE': 'CPG',
+  'GRAPHCODEBERT': 'GCB', 'ANNOTATE': 'Annotate', 'COMPLETE': 'Done',
+};
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+function initGraph() {
+  nodeDataSet = new vis.DataSet();
+  edgeDataSet = new vis.DataSet();
+  const container = document.getElementById('cpg-network');
+  network = new vis.Network(container, { nodes: nodeDataSet, edges: edgeDataSet }, {
+    physics: { enabled: true, stabilization: { iterations: 50 },
+               barnesHut: { gravitationalConstant: -6000, centralGravity: 0.2 } },
+    edges:   { arrows: 'to', width: 1, smooth: { type: 'continuous', roundness: .3 } },
+    nodes:   { shape: 'dot', size: 10, font: { color: '#e6edf3', size: 11 } },
+    interaction: { hover: true, tooltipDelay: 100 },
+  });
+  network.on('hoverNode', params => showNodeTooltip(params.node));
+}
+
+function initCharts() {
+  const bg = (r,g,b,a=0.8) => `rgba(${r},${g},${b},${a})`;
+  severityChart = new Chart(document.getElementById('severity-chart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['HIGH','MEDIUM','LOW'],
+      datasets: [{ data: [0,0,0],
+        backgroundColor: [bg(239,68,68), bg(245,158,11), bg(96,165,250)] }]
+    },
+    options: { responsive: true, maintainAspectRatio: false,
+               plugins: { legend: { labels: { color: '#8b949e', font: { size: 10 } } } } }
+  });
+  cweChart = new Chart(document.getElementById('cwe-chart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Findings', data: [],
+      backgroundColor: bg(37,99,235,.7) }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8b949e', font: { size: 9 } }, grid: { color: '#30363d' } },
+        y: { ticks: { color: '#8b949e', font: { size: 9 } }, grid: { color: '#30363d' } },
+      }
+    }
+  });
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + tab));
+}
+
+function switchRightTab(tab) {
+  ['findings','metrics','hitl-review'].forEach(id => {
+    document.getElementById('rt-' + id).classList.toggle('active', id === tab);
+    document.getElementById('rt-' + id + '-tab').classList.toggle('active', id === tab);
+  });
+}
+
+// ── Analysis start ────────────────────────────────────────────────────────────
+
+async function startAnalysis() {
+  clearGraph();
+  findings = [];
+  renderFindings();
+
+  let payload = {};
+  if (activeTab === 'repo') {
+    payload = {
+      repo_url:    document.getElementById('repo-url').value.trim(),
+      branch:      document.getElementById('repo-branch').value.trim() || 'main',
+      commit_sha:  document.getElementById('repo-sha').value.trim() || null,
+      token:       document.getElementById('repo-token').value.trim(),
+      max_repo_mb: parseInt(document.getElementById('repo-max-mb').value) || 100,
+    };
+    if (!payload.repo_url) { alert('Please enter a GitHub repository URL'); return; }
+  } else {
+    payload = {
+      code:     document.getElementById('inline-code').value,
+      language: document.getElementById('inline-lang').value,
+      filename: document.getElementById('inline-filename').value || 'snippet.py',
+    };
+    if (!payload.code.trim()) { alert('Please enter some code'); return; }
+  }
+
+  setStatus('running', 'Initialising...');
+  resetStages();
+  document.getElementById('graph-empty').style.display = 'none';
+
+  try {
+    const res  = await fetch('/api/analyze', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    sessionId  = data.session_id;
+
+    document.getElementById('session-badge').textContent = sessionId;
+    log(`Session started: ${sessionId}`, 'info');
+
+    connectEventStream();
+  } catch (err) {
+    setStatus('failed', 'Error');
+    log(`Failed to start: ${err}`, 'error');
+  }
+}
+
+// ── SSE connection ────────────────────────────────────────────────────────────
+
+function connectEventStream() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(`/api/session/${sessionId}/events`);
+  eventSource.onmessage = evt => handleEvent(JSON.parse(evt.data));
+  eventSource.onerror   = () => log('SSE connection error', 'error');
+}
+
+function handleEvent(evt) {
+  const type    = evt.type;
+  const payload = evt.payload || evt;
+
+  switch (type) {
+    case 'log':
+      log(payload.message, payload.level || 'info', payload.stage);
+      break;
+
+    case 'phase':
+      handlePhase(payload);
+      break;
+
+    case 'node':
+      addNode(payload);
+      break;
+
+    case 'edge':
+      addEdge(payload);
+      break;
+
+    case 'annotation':
+      handleAnnotation(payload);
+      break;
+
+    case 'finding':
+      handleFinding(payload);
+      break;
+
+    case 'metrics_update':
+      updateMetrics(payload);
+      break;
+
+    case 'hitl_state':
+      handleHITLState(payload);
+      break;
+
+    case 'complete':
+      handleComplete(payload);
+      break;
+
+    case 'error':
+      setStatus('failed', 'Error');
+      log(`Pipeline error: ${payload.message}`, 'error');
+      break;
+
+    case 'stream_end':
+      if (eventSource) eventSource.close();
+      break;
+  }
+}
+
+// ── Graph operations ──────────────────────────────────────────────────────────
+
+function addNode(n) {
+  if (!nodeDataSet) return;
+  if (nodeDataSet.get(n.id)) return;  // deduplicate
+  try {
+    nodeDataSet.add({
+      id:    n.id,
+      label: (n.label || n.id).substring(0, 20),
+      title: buildTooltip(n),
+      color: n.color || { background: '#6b7280', border: '#4b5563' },
+      shape: n.shape || 'dot',
+      size:  n.size  || 10,
+    });
+    nodeCount++;
+    const meta = n.meta || {};
+    if (meta.security_label === 'SINK')   sinkCount++;
+    if (meta.security_label === 'SOURCE') sourceCount++;
+    updateGraphStats();
+  } catch(e) {}
+}
+
+function addEdge(e) {
+  if (!edgeDataSet) return;
+  if (edgeDataSet.get(e.id)) return;
+  try {
+    edgeDataSet.add({
+      id:     e.id,
+      from:   e.from,
+      to:     e.to,
+      label:  e.label || '',
+      color:  e.color || { color: '#30363d' },
+      width:  e.width || 1,
+      dashes: e.dashes || false,
+    });
+    edgeCount++;
+    updateGraphStats();
+  } catch(e) {}
+}
+
+function buildTooltip(n) {
+  const m = n.meta || {};
+  let html = `<div style="background:#21262d;padding:8px;border-radius:6px;font-size:11px;max-width:260px">`;
+  html += `<b>${m.node_type || 'NODE'}</b> <span style="color:#8b949e">${n.id?.substring(0,8)}...</span><br>`;
+  if (m.file_path)  html += `📄 ${m.file_path}:${m.start_line || 0}<br>`;
+  if (m.security_label && m.security_label !== 'NONE')
+    html += `🔒 <span style="color:#ef4444">${m.security_label}</span><br>`;
+  if (m.cwe_hints?.length) html += `⚠️ ${m.cwe_hints.join(', ')}<br>`;
+  if (m.raw_text)  html += `<pre style="margin-top:4px;font-size:10px;white-space:pre-wrap;max-height:60px;overflow:hidden">${m.raw_text.substring(0,120)}</pre>`;
+  html += '</div>';
+  return html;
+}
+
+function handleAnnotation(a) {
+  if (!nodeDataSet || !a.node_id) return;
+  const n = nodeDataSet.get(a.node_id);
+  if (!n) return;
+  const col = a.severity === 'HIGH' ? '#ef4444' :
+              a.severity === 'MEDIUM' ? '#f59e0b' : '#60a5fa';
+  nodeDataSet.update({ id: a.node_id, color: { background: col, border: col },
+                       size: 16, shape: 'diamond' });
+}
+
+function fitGraph() { if (network) network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' } }); }
+function clearGraph() {
+  if (nodeDataSet) nodeDataSet.clear();
+  if (edgeDataSet) edgeDataSet.clear();
+  nodeCount = edgeCount = sinkCount = sourceCount = 0;
+  updateGraphStats();
+  document.getElementById('graph-empty').style.display = 'flex';
+}
+function updateGraphStats() {
+  document.getElementById('stat-nodes').textContent   = nodeCount;
+  document.getElementById('stat-edges').textContent   = edgeCount;
+  document.getElementById('stat-sinks').textContent   = sinkCount;
+  document.getElementById('stat-sources').textContent = sourceCount;
+  document.getElementById('hdr-nodes').textContent    = nodeCount;
+  document.getElementById('hdr-edges').textContent    = edgeCount;
+}
+
+// ── Findings ──────────────────────────────────────────────────────────────────
+
+function handleFinding(f) {
+  if (!findings.find(x => x.node_id === f.node_id && x.file_path === f.file_path)) {
+    findings.push(f);
+    document.getElementById('hdr-findings').textContent = findings.length;
+    renderFindings();
+  }
+}
+
+function renderFindings() {
+  const list = document.getElementById('findings-list');
+  if (!findings.length) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">No findings yet</div>';
+    return;
+  }
+  const sorted = [...findings].sort((a,b) => {
+    const s = {HIGH:0,MEDIUM:1,LOW:2};
+    return (s[a.severity]||3) - (s[b.severity]||3) || b.confidence - a.confidence;
+  });
+  list.innerHTML = sorted.map((f, i) => `
+    <div class="finding-card" onclick="toggleFinding(${i})">
+      <div class="finding-header">
+        <span class="severity-badge ${f.severity}">${f.severity}</span>
+        <span class="finding-type">${f.name || f.node_type}</span>
+        <span class="finding-cwe">${(f.cwe_hints||[]).join(', ')}</span>
+      </div>
+      <div class="finding-loc">📄 ${f.file_path || ''}:${f.start_line || 0}</div>
+      <div class="confidence-bar"><div class="confidence-fill" style="width:${(f.confidence||0)*100}%;background:${f.severity==='HIGH'?'#ef4444':f.severity==='MEDIUM'?'#f59e0b':'#60a5fa'}"></div></div>
+      <div class="finding-detail" id="fd-${i}">
+        <p class="finding-desc">${f.description || ''}</p>
+        ${f.raw_text ? `<pre class="finding-snippet">${escHtml(f.raw_text.substring(0,200))}</pre>` : ''}
+        ${f.remediation ? `<div class="finding-remediation">💡 ${f.remediation}</div>` : ''}
+        ${(f.references||[]).length ? `<div style="margin-top:4px;font-size:10px">${f.references.map(r=>`<a href="${r}" target="_blank" style="color:var(--accent)">${r}</a>`).join(' ')}</div>` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+function toggleFinding(i) {
+  const d = document.getElementById('fd-' + i);
+  d.classList.toggle('open');
+}
+
+// ── Phase handling ────────────────────────────────────────────────────────────
+
+const _stageStatus = {};
+function handlePhase(p) {
+  const stageName = p.stage || '';
+  const label     = p.label || stageName;
+  setStatus('running', label);
+  log(`[${stageName}] ${label}`, 'info', stageName);
+
+  // Update stage dots
+  Object.keys(_stageStatus).forEach(k => {
+    if (_stageStatus[k] === 'running') {
+      markStage(k, 'ok');
+      _stageStatus[k] = 'ok';
+    }
+  });
+  markStage(stageName, 'running');
+  _stageStatus[stageName] = 'running';
+
+  // HITL gate
+  if (stageName === 'hitl1_checkpoint' && p.approved == null) {
+    showHITLModal();
+  }
+}
+
+function markStage(stageName, status) {
+  // Try direct match
+  let dot = document.querySelector(`.stage-dot[data-stage="${stageName}"]`);
+  if (!dot) {
+    // Map phase name → stage dot
+    const mapping = {
+      'PARSE':'parsing','AST':'parsing','NORMALIZE':'parsing',
+      'CFG':'cpg_build','DFG':'cpg_build','CPG_MERGE':'cpg_build',
+      'GRAPHCODEBERT':'codeql_analysis','ANNOTATE':'sarif_annotation',
+      'COMPLETE':'emit_audit',
+    };
+    dot = document.querySelector(`.stage-dot[data-stage="${mapping[stageName]}"]`);
+  }
+  if (dot) {
+    dot.className = `stage-dot ${status}`;
+  }
+}
+
+function resetStages() {
+  document.querySelectorAll('.stage-dot').forEach(d => d.className = 'stage-dot');
+  Object.keys(_stageStatus).forEach(k => delete _stageStatus[k]);
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+function updateMetrics(m) {
+  metrics = m;
+  document.getElementById('m-nodes').textContent   = m.total_nodes   || 0;
+  document.getElementById('m-edges').textContent   = m.total_edges   || 0;
+  document.getElementById('m-findings').textContent= m.finding_count || 0;
+  document.getElementById('m-files').textContent   = m.total_files   || 0;
+  document.getElementById('m-density').textContent = (m.graph_density || 0).toFixed(4);
+  document.getElementById('m-fps').textContent     = m.files_per_second || 0;
+  document.getElementById('m-nps').textContent     = m.nodes_per_second || 0;
+  document.getElementById('m-mem').textContent     = m.memory_mb || 0;
+
+  // Severity chart
+  if (severityChart) {
+    severityChart.data.datasets[0].data = [
+      m.high_severity || 0, m.medium_severity || 0, m.low_severity || 0
+    ];
+    severityChart.update('none');
+  }
+
+  // CWE chart
+  if (cweChart && m.cwe_breakdown) {
+    const entries = Object.entries(m.cwe_breakdown).slice(0, 8);
+    cweChart.data.labels   = entries.map(([k]) => k);
+    cweChart.data.datasets[0].data = entries.map(([,v]) => v);
+    cweChart.update('none');
+  }
+
+  // Stage latency table
+  if (m.stage_latencies && Object.keys(m.stage_latencies).length) {
+    const rows = Object.entries(m.stage_latencies)
+      .map(([s,ms]) => `<tr><td>${s}</td><td>${Math.round(ms)}ms</td></tr>`)
+      .join('');
+    document.getElementById('stage-latency-table').innerHTML = rows;
+  }
+}
+
+// ── HITL ──────────────────────────────────────────────────────────────────────
+
+function handleHITLState(payload) {
+  const state = payload.state;
+  if (state === 'waiting') {
+    showHITLModal(payload.summary);
+    switchRightTab('hitl-review');
+    renderHITLReview(payload.summary);
+  } else if (state === 'approved') {
+    document.getElementById('hitl-overlay').classList.remove('show');
+    markStage('hitl1_checkpoint', 'ok');
+    log('HITL approved — pipeline resuming', 'info');
+  } else if (state === 'rejected') {
+    document.getElementById('hitl-overlay').classList.remove('show');
+    markStage('hitl1_checkpoint', 'failed');
+    setStatus('failed', 'HITL rejected');
+  }
+}
+
+function showHITLModal(summary) {
+  const modal = document.getElementById('hitl-overlay');
+  const content = document.getElementById('hitl-summary-content');
+  if (summary) {
+    content.innerHTML = buildHITLSummaryHTML(summary);
+  } else {
+    // Fetch summary
+    if (sessionId) {
+      fetch(`/api/session/${sessionId}/hitl/status`)
+        .then(r => r.json())
+        .then(d => { content.innerHTML = buildHITLSummaryHTML(d.summary || {}); });
+    }
+  }
+  modal.classList.add('show');
+}
+
+function buildHITLSummaryHTML(s) {
+  const cwes = Object.entries(s.top_cwes || {}).slice(0,5)
+    .map(([k,v]) => `<span class="cwe-pill">${k} (${v})</span>`).join('');
+  return `
+    <div class="hitl-row"><span>CPG Nodes</span><span>${s.cpg_nodes || 0}</span></div>
+    <div class="hitl-row"><span>CPG Edges</span><span>${s.cpg_edges || 0}</span></div>
+    <div class="hitl-row"><span>SARIF Alerts</span><span>${s.sarif_alerts || 0}</span></div>
+    <div class="hitl-row"><span>Taint Paths</span><span>${s.taint_edges || 0}</span></div>
+    <div class="hitl-row"><span>Findings 🔴</span><span style="color:var(--danger)">${s.high_severity || 0} HIGH</span></div>
+    <div class="hitl-row"><span>Findings 🟡</span><span style="color:var(--warn)">${s.medium_severity || 0} MEDIUM</span></div>
+    ${cwes ? `<div class="hitl-cwe"><span style="color:var(--muted);font-size:10px">CWEs: </span>${cwes}</div>` : ''}
+  `;
+}
+
+function renderHITLReview(summary) {
+  const el = document.getElementById('hitl-review-content');
+  el.innerHTML = buildHITLSummaryHTML(summary || {}) +
+    `<div style="margin-top:10px">
+      <button class="btn btn-approve" onclick="hitlApprove()">✅ Approve</button>
+      <button class="btn btn-reject" onclick="hitlReject()">❌ Reject</button>
+    </div>`;
+}
+
+async function hitlApprove() {
+  const notes    = document.getElementById('hitl-notes')?.value || '';
+  const operator = document.getElementById('hitl-operator')?.value || 'anonymous';
+  await fetch(`/api/session/${sessionId}/hitl/approve`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ approved: true, notes, operator }),
+  });
+  document.getElementById('hitl-overlay').classList.remove('show');
+  markStage('hitl1_checkpoint', 'ok');
+  log('HITL approved — pipeline resuming...', 'info');
+}
+
+async function hitlReject() {
+  const notes    = document.getElementById('hitl-notes')?.value || '';
+  const operator = document.getElementById('hitl-operator')?.value || 'anonymous';
+  await fetch(`/api/session/${sessionId}/hitl/reject`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ approved: false, notes, operator }),
+  });
+  document.getElementById('hitl-overlay').classList.remove('show');
+  setStatus('failed', 'HITL rejected');
+}
+
+// ── Complete / status ─────────────────────────────────────────────────────────
+
+function handleComplete(p) {
+  setStatus('complete', `Complete — ${p.finding_count || findings.length} findings`);
+  markStage('emit_audit', 'ok');
+  markStage('COMPLETE', 'ok');
+  log(`✅ Analysis complete. Nodes=${p.node_count} Edges=${p.edge_count} Findings=${p.finding_count}`, 'info');
+  fitGraph();
+  // Refresh metrics one more time
+  if (sessionId) {
+    fetch(`/api/session/${sessionId}/metrics`).then(r => r.json()).then(updateMetrics);
+  }
+}
+
+function setStatus(state, text) {
+  const dot  = document.getElementById('status-dot');
+  const span = document.getElementById('status-text');
+  dot.className  = `status-dot ${state}`;
+  span.textContent = text;
+}
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+function log(msg, level = 'info', stage = '') {
+  const el  = document.getElementById('log-console');
+  const div = document.createElement('div');
+  div.className = `log-line ${level}`;
+  const ts  = new Date().toTimeString().split(' ')[0];
+  const stg = stage ? `[${stage}] ` : '';
+  div.textContent = `${ts} ${stg}${msg}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  // Keep log from growing unbounded
+  while (el.children.length > 500) el.removeChild(el.firstChild);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function showNodeTooltip(nodeId) {
+  if (!nodeId) return;
+  const node = nodeDataSet?.get(nodeId);
+  if (node && network) {
+    // vis.js handles the tooltip via the title field we set on nodes
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+window.addEventListener('DOMContentLoaded', () => {
+  initGraph();
+  initCharts();
+  log('[PRISM] Dashboard ready. Configure your target and click Run.', 'info');
+});
+</script>
+</body>
+</html>
