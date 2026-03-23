@@ -70,6 +70,7 @@ class ParserRegistry:
 
         self._codeql_cli_path    = codeql_cli_path
         self._codeql_search_path = codeql_search_path
+        self._logger = logging.getLogger(__name__)
 
         logger.info(
             f"ParserRegistry initialized. "
@@ -190,6 +191,61 @@ class ParserRegistry:
         )
         return outputs
 
+    from __future__ import annotations
+    from pathlib import Path
+    from typing import Iterator
+    
+    
+    # ── Paste this method into ParserRegistry in parser/registry.py ──────────────
+    
+    def parse_repository_streaming(
+        self,
+        repo_path: "str | Path",
+        language_override: "Language | None" = None,
+    ) -> "Iterator[ParsedGraphOutput]":
+        """
+        Parse all source files in a repository, yielding one ParsedGraphOutput
+        per file as soon as it completes — enabling real-time streaming to the UI.
+    
+        This is the streaming counterpart to parse_repository(). The routing
+        logic (Joern → Tree-sitter → Fallback) is identical; only the delivery
+        mechanism changes from a collected list to a per-file yield.
+    
+        Args:
+            repo_path:         path to the sandboxed repository directory
+            language_override: force a specific language for all files (rare)
+    
+        Yields:
+            ParsedGraphOutput — one per successfully parsed file, in filesystem
+            order. Files that fail to parse are skipped with a logged error.
+        """
+        repo_path = Path(repo_path)
+    
+        all_files = [
+            f for f in repo_path.rglob("*")
+            if f.is_file() and not _should_skip(f)
+        ]
+    
+        self._logger.info(
+            "parse_repository_streaming: %s (%d files)", repo_path, len(all_files)
+        )
+    
+        for file_path in all_files:
+            try:
+                result = self.parse_file(file_path)
+                self._logger.debug(
+                    "  [%s] %s → %d nodes, %d edges",
+                    result.metadata.backend.value,
+                    file_path.name,
+                    len(result.nodes),
+                    len(result.edges),
+                )
+                yield result
+            except Exception as exc:
+                self._logger.error(
+                    "parse_repository_streaming: failed on %s: %s",
+                    file_path, exc, exc_info=True,
+                )
     # ── Internal dispatch ─────────────────────────────────────────────────────
 
     def _dispatch(

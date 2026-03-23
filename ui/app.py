@@ -1,9 +1,9 @@
 """
 PRISM Dashboard — app.py
 ========================
-Flask app with dual transport:
+FastAPI app with dual transport:
   • SSE   — pipeline log + progress events (unchanged from original)
-  • WebSocket (flask-sock) — real-time node/edge streaming as CPG is built
+  • WebSocket — real-time node/edge streaming as CPG is built
 
 Pipeline stages:
   1. Credential acquisition  (token → SecureString / Vault)
@@ -24,12 +24,13 @@ gVisor integration:
   malicious repository code and the analyst's machine.
 
 Run:
-    pip install flask flask-sock
-    python -m ui.app           # http://localhost:5001
+    pip install fastapi uvicorn jinja2
+    uvicorn ui.app:app --host 0.0.0.0 --port 5001
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -42,16 +43,15 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, AsyncGenerator
 
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
-
-try:
-    from flask_sock import Sock
-    _SOCK_AVAILABLE = True
-except ImportError:
-    _SOCK_AVAILABLE = False
-    logging.warning("flask-sock not installed — WebSocket disabled. pip install flask-sock")
+# ── FastAPI (replaces Flask + flask-sock) ─────────────────────────────────────
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 # ── PRISM pipeline imports (graceful degradation) ─────────────────────────────
 try:
@@ -74,11 +74,23 @@ except ImportError:
     _CPG_BUILDER_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
-app = Flask(__name__, template_folder="templates", static_folder="static")
-app.config["SECRET_KEY"] = os.environ.get("PRISM_UI_SECRET", "dev-only-secret")
+app = FastAPI(title="PRISM Dashboard")
 
-if _SOCK_AVAILABLE:
-    sock = Sock(app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+_STATIC_DIR   = Path(__file__).resolve().parent / "static"
+
+templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # ── Per-session state ─────────────────────────────────────────────────────────
 _sessions: dict[str, dict[str, Any]] = {}
@@ -217,14 +229,14 @@ def _make_session(session_id: str) -> dict[str, Any]:
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route("/")
-def index() -> str:
-    return render_template("index.html")
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.route("/api/status")
-def api_status() -> Response:
-    return jsonify({
+@app.get("/api/status")
+async def api_status() -> JSONResponse:
+    return JSONResponse({
         "pipeline_available": _PIPELINE_AVAILABLE,
         "gvisor_available":   _gvisor_available(),
         "vault_addr":         os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200"),
@@ -232,8 +244,8 @@ def api_status() -> Response:
     })
 
 
-@app.route("/api/analyze", methods=["POST"])
-def api_analyze() -> Response:
+@app.post("/api/analyze")
+async def api_analyze(request: Request) -> JSONResponse:
     """
     Start a new analysis session.
 
@@ -247,7 +259,11 @@ def api_analyze() -> Response:
     Response:
         {"session_id": "sess_abc123", "ws_url": "/ws/graph/sess_abc123"}
     """
-    body        = request.get_json(force=True, silent=True) or {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
     repo_url    = (body.get("repo_url") or "").strip()
     branch      = (body.get("branch") or "main").strip()
     commit_sha  = (body.get("commit_sha") or "").strip() or None
@@ -255,9 +271,9 @@ def api_analyze() -> Response:
     max_repo_mb = int(body.get("max_repo_mb") or 100)
 
     if not repo_url:
-        return jsonify({"error": "repo_url is required"}), 400
+        return JSONResponse({"error": "repo_url is required"}, status_code=400)
     if not repo_url.startswith("https://"):
-        return jsonify({"error": "Only HTTPS repository URLs are accepted"}), 400
+        return JSONResponse({"error": "Only HTTPS repository URLs are accepted"}, status_code=400)
 
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     session    = _make_session(session_id)
@@ -270,27 +286,33 @@ def api_analyze() -> Response:
     )
     t.start()
 
-    return jsonify({
+    return JSONResponse({
         "session_id": session_id,
         "ws_url": f"/ws/graph/{session_id}",
     })
 
 
-@app.route("/api/session/<session_id>/events")
-def session_events(session_id: str) -> Response:
+@app.get("/api/session/{session_id}/events")
+async def session_events(session_id: str, request: Request) -> StreamingResponse:
     """SSE stream — log messages + progress for the left panel."""
     session = _sessions.get(session_id)
     if not session:
-        return jsonify({"error": "session not found"}), 404
+        return JSONResponse({"error": "session not found"}, status_code=404)
 
-    def generate() -> Generator[str, None, None]:
+    async def generate() -> AsyncGenerator[str, None]:
         q: queue.Queue = session["log_queue"]
         while True:
+            # honour client disconnect
+            if await request.is_disconnected():
+                return
+
             status = session["status"]
             try:
-                event = q.get(timeout=0.5)
+                event = q.get_nowait()
                 yield f"data: {json.dumps(event)}\n\n"
             except queue.Empty:
+                # replaces the blocking q.get(timeout=0.5) from the Flask version
+                await asyncio.sleep(0.1)
                 yield f"data: {json.dumps({'type': 'heartbeat', 'status': status})}\n\n"
 
             if status in ("complete", "failed"):
@@ -308,74 +330,82 @@ def session_events(session_id: str) -> Response:
                 yield f"data: {json.dumps(payload)}\n\n"
                 return
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control":     "no-cache",
             "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
         },
     )
 
 
-@app.route("/api/session/<session_id>/findings")
-def session_findings(session_id: str) -> Response:
+@app.get("/api/session/{session_id}/findings")
+async def session_findings(session_id: str) -> JSONResponse:
     session = _sessions.get(session_id)
     if not session:
-        return jsonify({"error": "session not found"}), 404
-    return jsonify(session.get("findings") or [])
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    return JSONResponse(session.get("findings") or [])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WebSocket endpoint — real-time node/edge streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
-if _SOCK_AVAILABLE:
-    @sock.route("/ws/graph/<session_id>")
-    def ws_graph(ws, session_id: str):
-        """
-        WebSocket endpoint that streams CPG nodes + edges as they are built.
-        The client connects immediately after receiving the session_id from
-        /api/analyze. Events are the same schema as the FastAPI backend:
+@app.websocket("/ws/graph/{session_id}")
+async def ws_graph(websocket: WebSocket, session_id: str) -> None:
+    """
+    WebSocket endpoint that streams CPG nodes + edges as they are built.
+    The client connects immediately after receiving the session_id from
+    /api/analyze. Events are the same schema as the FastAPI backend:
 
-            {"type": "phase",       "payload": {"stage": "...", "label": "..."}}
-            {"type": "node",        "payload": {CPGNode dict}}
-            {"type": "edge",        "payload": {CPGEdge dict}}
-            {"type": "annotation",  "payload": {"node_id": ..., "severity": ...}}
-            {"type": "finding",     "payload": {VulnerabilityFinding dict}}
-            {"type": "complete",    "payload": {"node_count": ..., "edge_count": ..., "finding_count": ...}}
-            {"type": "heartbeat"}
-            {"type": "error",       "payload": {"message": "..."}}
-        """
-        session = _sessions.get(session_id)
-        if not session:
-            ws.send(json.dumps({"type": "error", "payload": {"message": "session not found"}}))
-            return
+        {"type": "phase",       "payload": {"stage": "...", "label": "..."}}
+        {"type": "node",        "payload": {CPGNode dict}}
+        {"type": "edge",        "payload": {CPGEdge dict}}
+        {"type": "annotation",  "payload": {"node_id": ..., "severity": ...}}
+        {"type": "finding",     "payload": {VulnerabilityFinding dict}}
+        {"type": "complete",    "payload": {"node_count": ..., "edge_count": ..., "finding_count": ...}}
+        {"type": "heartbeat"}
+        {"type": "error",       "payload": {"message": "..."}}
+    """
+    await websocket.accept()
 
-        gq: queue.Queue = session["graph_queue"]
-        last_heartbeat = time.time()
+    session = _sessions.get(session_id)
+    if not session:
+        await websocket.send_text(json.dumps({"type": "error", "payload": {"message": "session not found"}}))
+        await websocket.close()
+        return
 
+    gq: queue.Queue = session["graph_queue"]
+    last_heartbeat = time.time()
+
+    try:
         while True:
             try:
-                event = gq.get(timeout=0.3)
-                ws.send(json.dumps(event))
+                event = gq.get_nowait()
+                # replaces the blocking gq.get(timeout=0.3) from the Flask version
+                await websocket.send_text(json.dumps(event))
                 if event.get("type") in ("complete", "error"):
                     break
             except queue.Empty:
+                # yield control to the event loop instead of blocking
+                await asyncio.sleep(0.05)
                 # Send heartbeat every 10 s to keep WS alive
                 if time.time() - last_heartbeat > 10:
-                    ws.send(json.dumps({"type": "heartbeat"}))
+                    await websocket.send_text(json.dumps({"type": "heartbeat"}))
                     last_heartbeat = time.time()
                 # Check if session failed externally
                 if session["status"] == "failed":
-                    ws.send(json.dumps({
+                    await websocket.send_text(json.dumps({
                         "type": "error",
                         "payload": {"message": session.get("error", "Pipeline failed")},
                     }))
                     break
-            except Exception:
-                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -731,13 +761,13 @@ def _extract_findings(parse_outputs: list) -> list[dict]:
             "references": ["https://owasp.org/www-community/attacks/Command_Injection", "https://cwe.mitre.org/data/definitions/78.html"],
         },
         "CWE-22":  {
-            "description": "A file path constructed from user input may allow directory traversal, granting access to arbitrary files.",
-            "remediation": "Resolve and canonicalise paths with os.path.realpath(). Reject paths outside the allowed root.",
+            "description": "A file path derived from user input is not canonicalised. An attacker can escape the intended directory.",
+            "remediation": "Use os.path.realpath() and validate the result is within the expected base directory.",
             "references": ["https://owasp.org/www-community/attacks/Path_Traversal", "https://cwe.mitre.org/data/definitions/22.html"],
         },
         "CWE-502": {
-            "description": "Deserialising data from an untrusted source can allow arbitrary code execution.",
-            "remediation": "Use pickle only on trusted data. Replace yaml.load with yaml.safe_load.",
+            "description": "Untrusted data is deserialised without validation. An attacker can craft a payload that executes arbitrary code.",
+            "remediation": "Use safe formats (JSON/YAML safe_load). Never deserialise untrusted data with pickle/marshal.",
             "references": ["https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data", "https://cwe.mitre.org/data/definitions/502.html"],
         },
         "CWE-798": {
@@ -746,8 +776,8 @@ def _extract_findings(parse_outputs: list) -> list[dict]:
             "references": ["https://cwe.mitre.org/data/definitions/798.html"],
         },
         "CWE-79":  {
-            "description": "User-supplied data is injected into the DOM without escaping. An attacker can execute arbitrary JavaScript in a victim's browser.",
-            "remediation": "Escape all user input before DOM insertion. Use framework-provided safe rendering.",
+            "description": "User-supplied data is rendered in an HTML context without escaping. An attacker can execute arbitrary JavaScript in a victim's browser.",
+            "remediation": "Escape all user input before DOM insertion. Use framework-provided safe rendering (React JSX, Jinja2 autoescaping).",
             "references": ["https://owasp.org/www-community/attacks/xss/", "https://cwe.mitre.org/data/definitions/79.html"],
         },
         "CWE-306": {
@@ -835,7 +865,8 @@ def _inject_demo_data(session: dict, repo_url: str,
             "id": nid, "label": label,
             "color": {"background": bg, "border": _darken(bg)},
             "shape": shape, "size": size, "group": ntype,
-            "meta": {"file_path": fpath, "start_line": line, "node_type": ntype,
+            "meta": {"file_path": fpath,
+                     "start_line": line, "node_type": ntype,
                      "security_label": sec_label, "cwe_hints": cwes,
                      "raw_text": raw, "backend": backend},
         })
@@ -950,6 +981,7 @@ def _check_vault() -> bool:
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import uvicorn
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -958,4 +990,4 @@ if __name__ == "__main__":
     print(f"\n  PRISM Dashboard  →  http://localhost:{port}\n")
     print(f"  gVisor available: {_gvisor_available()}")
     print(f"  Pipeline available: {_PIPELINE_AVAILABLE}\n")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    uvicorn.run("ui.app:app", host="0.0.0.0", port=port, reload=False, log_level="info")

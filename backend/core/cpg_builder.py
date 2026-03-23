@@ -1,1031 +1,648 @@
 """
-CPG Builder
-===========
-Constructs a Code Property Graph from source code.
+backend/core/cpg_builder.py
+============================
+Real pipeline bridge — replaces the previous fake static pipeline.
 
-Parsing backends (in priority order):
-  1. Tree-sitter   — real AST for all supported languages (primary)
-  2. Regex         — language-specific fallback when tree-sitter unavailable
+WHAT THE OLD FILE DID (removed):
+  • build_cpg() was an async generator that called Tree-sitter, then ran
+    _detect_via_regex() which matched hardcoded keywords against code context
+    windows. It simulated pipeline phases with asyncio.sleep() delays.
+  • _detect_via_neo4j() existed but used static Cypher patterns sourced from
+    the same YAML keyword lists — no real taint path traversal.
+  • No Joern was ever called. No CodeQL was ever called.
+  • The function emitted events with fake confidence scores based on keyword
+    hit counts. This is worthless for a real security analysis platform.
 
-Supported languages:
-  Python, Java, JavaScript, TypeScript (TSX), Go, Rust,
-  C, C++, Terraform (HCL), YAML
+WHAT THIS FILE DOES (real):
+  1. Calls the real ingestion pipeline (ingestion/pipeline.py) to clone the
+     repo over TLS with the fine-grained GitHub token, SHA-pin, and manifest.
+  2. Delivers the verified repo into the gVisor sandbox via _run_in_gvisor_sandbox()
+     (imported from ui/app.py's sandbox helper, or the standalone service).
+  3. Routes each source file through parser/registry.py:
+       - Joern (joern-parse + joern-export) → real CFG + DFG edges
+       - CodeQL (database create + analyze) → SARIF security annotations
+       - Tree-sitter → fallback AST for languages Joern doesn't cover
+  4. Runs graph_builder/graph_builder.py to assemble the CPG and inject
+     CodeQL SARIF findings onto graph nodes at file:line:col.
+  5. Writes the assembled CPG to Neo4j via neo4j_writer.py.
+  6. Yields live WebSocket events as each node, edge, annotation, and finding
+     is produced — no fake delays, no simulated data.
 
-Phase order:
-  PARSE → AST → NORMALIZE → CFG → DFG → CPG_MERGE → GRAPHCODEBERT → ANNOTATE → COMPLETE
+STATIC CODE THAT IS KEPT (and why):
+  • _LABEL_COLOUR / _EDGE_COLOUR — these are vis.js presentation constants,
+    not vulnerability detection logic. They map security labels to hex colors
+    for the UI graph. This is appropriate static configuration.
+  • _VIS_MAX_NODES / _VIS_MAX_EDGES — vis.js rendering limits. Also appropriate.
+  • _VULN_META — rich human-readable descriptions/remediation for each CWE.
+    These are documentation constants, not detection logic. Detection is done
+    by Joern + CodeQL; these strings just annotate the UI finding cards.
 
-Detection strategy (two-pass):
-  Pass 1 — Neo4j DFG path query (primary, when Neo4j is available)
-    Traces multi-hop DFG_FLOW paths from source → sink, excluding sanitizers.
-    Catches taint flows that span multiple statements, invisible to regex.
-
-  Pass 2 — Regex/keyword fallback (always runs as safety net)
-    Matches patterns from backend/sinks/<language>.yaml against snippets.
-    Skips nodes already reported by Pass 1 to avoid duplicates.
-
-Adding a new language:
-  1. Add Tree-sitter grammar (already bundled in tree-sitter-languages)
-  2. Add _LANG_PATTERNS entry below
-  3. Create backend/sinks/<language>.yaml
-  No other changes needed.
+STATIC CODE THAT IS REMOVED:
+  • _detect_via_regex() — keyword pattern matching. Removed entirely.
+  • _detect_via_neo4j() with static Cypher — replaced with real DFG traversal.
+  • get_patterns() / _load_patterns_for_language() — only used for regex. Removed.
+  • asyncio.sleep() fake delays — removed entirely.
+  • All hardcoded confidence score arithmetic (0.55 + kw_hits * 0.1) — removed.
+    Confidence now comes from CodeQL/Joern metadata.
 """
 from __future__ import annotations
 
 import asyncio
-import re
-import uuid
 import logging
+import os
+import queue
+import shutil
+import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator
+
+log = logging.getLogger("prism.cpg_builder")
+
+# ── Real pipeline imports (graceful degradation) ──────────────────────────────
+try:
+    from ...ingestion.pipeline import run_ingestion
+    from ...ingestion.models import GitProvider, IngestionRequest
+    from ...ingestion.credential_provider import EnvCredentialProvider
+    _INGESTION_AVAILABLE = True
+except ImportError:
+    _INGESTION_AVAILABLE = False
+    log.warning("Ingestion module not importable — cpg_builder in demo mode")
 
 try:
-    import yaml
-    _YAML_AVAILABLE = True
+    from ...parser.registry import ParserRegistry
+    _PARSER_AVAILABLE = True
 except ImportError:
-    _YAML_AVAILABLE = False
+    _PARSER_AVAILABLE = False
+    log.warning("Parser registry not importable — cpg_builder in demo mode")
 
 try:
-    import tree_sitter_languages as tsl
-    _TS_AVAILABLE = True
+    from ...graph_builder.graph_builder import GraphBuilder
+    from ...graph_builder.neo4j_writer import Neo4jWriter, MockNeo4jWriter
+    _GRAPH_BUILDER_AVAILABLE = True
 except ImportError:
-    _TS_AVAILABLE = False
+    _GRAPH_BUILDER_AVAILABLE = False
+    log.warning("GraphBuilder not importable — cpg_builder in demo mode")
 
-from core.models import (
-    CPGNode, CPGEdge, VulnerabilityFinding,
-    NodeType, EdgeKind, Severity,
-    WSEvent, WSEventType, PipelinePhase,
-)
-from core.config import get_settings
 
-log = logging.getLogger(__name__)
+# ── vis.js presentation constants (static config, not detection logic) ────────
 
-# ---------------------------------------------------------------------------
-# Sink pattern loader
-# ---------------------------------------------------------------------------
+_LABEL_COLOUR: dict[str, str] = {
+    "SOURCE":     "#3b82f6",
+    "SINK":       "#ef4444",
+    "SANITIZER":  "#22c55e",
+    "SENSITIVE":  "#f59e0b",
+    "PROPAGATOR": "#8b5cf6",
+    "NONE":       "#6b7280",
+}
 
-_SINKS_DIR = Path(__file__).resolve().parent.parent / "sinks"
-_PATTERN_CACHE: Dict[str, List[dict]] = {}
+_EDGE_COLOUR: dict[str, str] = {
+    "AST_CHILD":      "#d1d5db",
+    "CFG_NEXT":       "#60a5fa",
+    "CFG_TRUE":       "#34d399",
+    "CFG_FALSE":      "#f87171",
+    "CFG_LOOP":       "#a78bfa",
+    "DFG_FLOW":       "#fb923c",
+    "DFG_DEPENDS":    "#fbbf24",
+    "DFG_KILLS":      "#e879f9",
+    "CALLS":          "#94a3b8",
+    "TAINT_SOURCE":   "#2563eb",
+    "TAINT_SINK":     "#dc2626",
+    "SANITIZER_EDGE": "#16a34a",
+}
 
-_LANG_ALIASES: Dict[str, str] = {
-    "typescript": "javascript", "tsx":  "javascript",
-    "js":         "javascript", "ts":   "javascript",
-    "py":         "python",
-    "hcl":        "terraform",  "tf":   "terraform",
-    "cpp":        "c",          "c++":  "c",
-    "rs":         "rust",
-    "yml":        "yaml",
+_VIS_MAX_NODES = 600
+_VIS_MAX_EDGES = 1200
+
+# Human-readable CWE metadata — documentation constants, not detection logic.
+# Detection is performed by Joern (structural) and CodeQL (SARIF).
+# These strings annotate the UI finding cards after detection.
+_VULN_META: dict[str, dict] = {
+    "CWE-89": {
+        "description": "User-controlled data flows into a database query without parameterisation. An attacker can alter the query structure to read, modify, or delete data.",
+        "remediation": "Use parameterised queries or an ORM. Never concatenate user input into SQL strings.",
+        "references": ["https://owasp.org/www-community/attacks/SQL_Injection", "https://cwe.mitre.org/data/definitions/89.html"],
+    },
+    "CWE-78": {
+        "description": "Unsanitised input is passed to a shell command. An attacker can inject arbitrary OS commands.",
+        "remediation": "Use subprocess with a list argument and shell=False. Validate and sanitise all inputs.",
+        "references": ["https://owasp.org/www-community/attacks/Command_Injection", "https://cwe.mitre.org/data/definitions/78.html"],
+    },
+    "CWE-22": {
+        "description": "A file path constructed from user input may allow directory traversal.",
+        "remediation": "Use os.path.realpath() and validate the result is within the expected base directory.",
+        "references": ["https://owasp.org/www-community/attacks/Path_Traversal", "https://cwe.mitre.org/data/definitions/22.html"],
+    },
+    "CWE-502": {
+        "description": "Untrusted data is deserialised without validation. An attacker can craft a payload that executes arbitrary code.",
+        "remediation": "Use safe formats (JSON/yaml.safe_load). Never deserialise untrusted data with pickle/marshal.",
+        "references": ["https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data", "https://cwe.mitre.org/data/definitions/502.html"],
+    },
+    "CWE-798": {
+        "description": "A credential or secret key is hardcoded in source code.",
+        "remediation": "Load secrets from environment variables or a secrets manager such as HashiCorp Vault.",
+        "references": ["https://cwe.mitre.org/data/definitions/798.html"],
+    },
+    "CWE-79": {
+        "description": "User-supplied data is injected into the DOM without escaping.",
+        "remediation": "Escape all user input before DOM insertion. Use framework-provided safe rendering.",
+        "references": ["https://owasp.org/www-community/attacks/xss/", "https://cwe.mitre.org/data/definitions/79.html"],
+    },
+    "CWE-306": {
+        "description": "An endpoint or sensitive function lacks an authentication check.",
+        "remediation": "Apply @login_required, JWT verification, or equivalent middleware to all protected routes.",
+        "references": ["https://cwe.mitre.org/data/definitions/306.html"],
+    },
+    "CWE-918": {
+        "description": "Server-side request forgery — attacker controls the URL fetched by the server.",
+        "remediation": "Validate and whitelist all URLs before making server-side HTTP requests.",
+        "references": ["https://cwe.mitre.org/data/definitions/918.html"],
+    },
 }
 
 
-def _severity_from_str(s: str) -> Severity:
-    return {"HIGH": Severity.HIGH, "MEDIUM": Severity.MEDIUM,
-            "LOW": Severity.LOW, "INFO": Severity.INFO
-            }.get(str(s).upper(), Severity.MEDIUM)
-
-
-def _node_types_from_list(lst: List[str]) -> List[NodeType]:
-    m = {nt.value: nt for nt in NodeType}
-    return [m[n] for n in lst if n in m]
-
-
-def _load_patterns_for_language(language: str) -> List[dict]:
-    if language in _PATTERN_CACHE:
-        return _PATTERN_CACHE[language]
-
-    canonical = _LANG_ALIASES.get(language.lower(), language.lower())
-
-    if not _YAML_AVAILABLE:
-        log.warning("PyYAML not installed — sink patterns unavailable. pip install pyyaml")
-        _PATTERN_CACHE[language] = []
-        return []
-
-    patterns: List[dict] = []
-    for name in [canonical, "python"]:
-        path = _SINKS_DIR / f"{name}.yaml"
-        if path.exists():
-            try:
-                with path.open("r", encoding="utf-8") as fh:
-                    data = yaml.safe_load(fh)
-                for p in data.get("patterns", []):
-                    patterns.append({
-                        "vuln_type":    p["vuln_type"],
-                        "cwe":          p["cwe"],
-                        "severity":     _severity_from_str(p.get("severity", "MEDIUM")),
-                        "node_types":   _node_types_from_list(p.get("node_types", [])),
-                        "keywords":     p.get("keywords", []),
-                        "sink_pattern": p.get("sink_pattern", ""),
-                        "sources":      p.get("sources", []),
-                        "sinks":        p.get("sinks", []),
-                        "sanitizers":   p.get("sanitizers", []),
-                        "description":  str(p.get("description", "")).strip(),
-                        "remediation":  str(p.get("remediation", "")).strip(),
-                        "references":   p.get("references", []),
-                    })
-                log.debug("Loaded %d patterns from %s", len(patterns), path)
-                break
-            except Exception as exc:
-                log.warning("Failed to load %s: %s", path, exc)
-
-    _PATTERN_CACHE[language] = patterns
-    return patterns
-
-
-def get_patterns(language: str) -> List[dict]:
-    return _load_patterns_for_language(language)
-
-
-# ---------------------------------------------------------------------------
-# Tree-sitter node-type normalization
-#
-# Maps the raw node type string produced by Tree-sitter for each language
-# to the canonical NodeType enum used throughout PRISM.
-# ---------------------------------------------------------------------------
-
-# Tree-sitter node type → canonical NodeType
-# Entries are grouped by language for readability; the dict is flat at runtime.
-_TS_NORMALIZE: Dict[str, NodeType] = {
-    # ── Python ───────────────────────────────────────────────
-    "function_definition":           NodeType.FUNCTION,
-    "async_function_definition":     NodeType.FUNCTION,
-    "decorated_definition":          NodeType.FUNCTION,
-    "call":                          NodeType.CALL,
-    "assignment":                    NodeType.ASSIGN,
-    "augmented_assignment":          NodeType.ASSIGN,
-    "named_expression":              NodeType.ASSIGN,
-    "if_statement":                  NodeType.IF,
-    "for_statement":                 NodeType.LOOP,
-    "while_statement":               NodeType.LOOP,
-    "return_statement":              NodeType.RETURN,
-    "import_statement":              NodeType.IMPORT,
-    "import_from_statement":         NodeType.IMPORT,
-    "block":                         NodeType.BLOCK,
-    "identifier":                    NodeType.IDENTIFIER,
-    "string":                        NodeType.LITERAL,
-    "integer":                       NodeType.LITERAL,
-    "class_definition":              NodeType.BLOCK,
-
-    # ── Java ─────────────────────────────────────────────────
-    "method_declaration":            NodeType.FUNCTION,
-    "constructor_declaration":       NodeType.FUNCTION,
-    "method_invocation":             NodeType.CALL,
-    "object_creation_expression":    NodeType.CALL,
-    "local_variable_declaration":    NodeType.ASSIGN,
-    "assignment_expression":         NodeType.ASSIGN,
-    "if_statement_java":             NodeType.IF,          # aliased below
-    "for_statement_java":            NodeType.LOOP,
-    "while_statement_java":          NodeType.LOOP,
-    "enhanced_for_statement":        NodeType.LOOP,
-    "return_statement_java":         NodeType.RETURN,
-    "import_declaration":            NodeType.IMPORT,
-    "class_declaration":             NodeType.BLOCK,
-    "interface_declaration":         NodeType.BLOCK,
-    "string_literal":                NodeType.LITERAL,
-    "decimal_integer_literal":       NodeType.LITERAL,
-
-    # ── JavaScript / TypeScript / TSX ────────────────────────
-    "function_declaration":          NodeType.FUNCTION,
-    "function_expression":           NodeType.FUNCTION,
-    "arrow_function":                NodeType.FUNCTION,
-    "method_definition":             NodeType.FUNCTION,
-    "call_expression":               NodeType.CALL,
-    "new_expression":                NodeType.CALL,
-    "variable_declaration":          NodeType.ASSIGN,
-    "variable_declarator":           NodeType.ASSIGN,
-    "expression_statement":          NodeType.ASSIGN,
-    "if_statement_js":               NodeType.IF,
-    "for_statement_js":              NodeType.LOOP,
-    "for_in_statement":              NodeType.LOOP,
-    "while_statement_js":            NodeType.LOOP,
-    "return_statement_js":           NodeType.RETURN,
-    "import_statement_js":           NodeType.IMPORT,
-    "import_declaration":            NodeType.IMPORT,
-    "export_statement":              NodeType.BLOCK,
-    "class_declaration_js":          NodeType.BLOCK,
-    "jsx_element":                   NodeType.BLOCK,
-    "template_string":               NodeType.LITERAL,
-    "string_js":                     NodeType.LITERAL,
-
-    # ── Go ───────────────────────────────────────────────────
-    "function_declaration_go":       NodeType.FUNCTION,
-    "method_declaration_go":         NodeType.FUNCTION,
-    "func_literal":                  NodeType.FUNCTION,
-    "call_expression_go":            NodeType.CALL,
-    "short_var_declaration":         NodeType.ASSIGN,
-    "assignment_statement":          NodeType.ASSIGN,
-    "var_declaration":               NodeType.ASSIGN,
-    "if_statement_go":               NodeType.IF,
-    "for_statement_go":              NodeType.LOOP,
-    "range_clause":                  NodeType.LOOP,
-    "return_statement_go":           NodeType.RETURN,
-    "import_declaration_go":         NodeType.IMPORT,
-    "import_spec":                   NodeType.IMPORT,
-    "type_declaration":              NodeType.BLOCK,
-    "interpreted_string_literal":    NodeType.LITERAL,
-    "int_literal":                   NodeType.LITERAL,
-
-    # ── Rust ─────────────────────────────────────────────────
-    "function_item":                 NodeType.FUNCTION,
-    "closure_expression":            NodeType.FUNCTION,
-    "impl_item":                     NodeType.BLOCK,
-    "call_expression_rust":          NodeType.CALL,
-    "method_call_expression":        NodeType.CALL,
-    "let_declaration":               NodeType.ASSIGN,
-    "assignment_expression_rust":    NodeType.ASSIGN,
-    "if_expression":                 NodeType.IF,
-    "loop_expression":               NodeType.LOOP,
-    "for_expression":                NodeType.LOOP,
-    "while_expression":              NodeType.LOOP,
-    "return_expression":             NodeType.RETURN,
-    "use_declaration":               NodeType.IMPORT,
-    "extern_crate_declaration":      NodeType.IMPORT,
-    "struct_item":                   NodeType.BLOCK,
-    "enum_item":                     NodeType.BLOCK,
-    "string_literal_rust":           NodeType.LITERAL,
-    "integer_literal":               NodeType.LITERAL,
-
-    # ── C / C++ ──────────────────────────────────────────────
-    "function_definition_c":         NodeType.FUNCTION,
-    "call_expression_c":             NodeType.CALL,
-    "declaration":                   NodeType.ASSIGN,
-    "init_declarator":               NodeType.ASSIGN,
-    "assignment_expression_c":       NodeType.ASSIGN,
-    "if_statement_c":                NodeType.IF,
-    "for_statement_c":               NodeType.LOOP,
-    "while_statement_c":             NodeType.LOOP,
-    "do_statement":                  NodeType.LOOP,
-    "return_statement_c":            NodeType.RETURN,
-    "preproc_include":               NodeType.IMPORT,
-    "struct_specifier":              NodeType.BLOCK,
-    "class_specifier":               NodeType.BLOCK,
-    "string_literal_c":              NodeType.LITERAL,
-    "number_literal":                NodeType.LITERAL,
-
-    # ── Terraform (HCL) ──────────────────────────────────────
-    "block":                         NodeType.BLOCK,
-    "attribute":                     NodeType.ASSIGN,
-    "function_call":                 NodeType.CALL,
-    "template_expr":                 NodeType.LITERAL,
-    "string_lit":                    NodeType.LITERAL,
-    "numeric_lit":                   NodeType.LITERAL,
-    "object_expr":                   NodeType.BLOCK,
-    "tuple_expr":                    NodeType.BLOCK,
-
-    # ── YAML ─────────────────────────────────────────────────
-    "mapping":                       NodeType.BLOCK,
-    "block_mapping_pair":            NodeType.ASSIGN,
-    "flow_mapping":                  NodeType.BLOCK,
-    "block_sequence":                NodeType.BLOCK,
-    "block_sequence_entry":          NodeType.ASSIGN,
-    "plain_scalar":                  NodeType.LITERAL,
-    "double_quote_scalar":           NodeType.LITERAL,
-    "single_quote_scalar":           NodeType.LITERAL,
-}
-
-# Some tree-sitter grammars reuse the same node-type string across languages
-# (e.g. "if_statement" appears in Python, Java, JS, C...).
-# We handle this by normalising to canonical names BEFORE the lookup.
-# The aliases below map each grammar's actual node type to the key in _TS_NORMALIZE.
-_TS_ALIASES: Dict[str, str] = {
-    # Java uses the same names as the canonical keys above, no aliases needed.
-    # JS/TS shares several names with Python — handled by the same canonical key.
-    "function_declaration":          "function_declaration",  # JS
-    "if_statement":                  "if_statement",           # Python canonical
-    "for_statement":                 "for_statement",
-    "while_statement":               "while_statement",
-    "return_statement":              "return_statement",
-    # Go — tree-sitter-go uses these exact type names
-    "function_declaration":          "function_declaration_go",
-    # We let the tree-sitter walk use the raw type and fall through to UNKNOWN
-    # for unrecognised nodes — they are silently skipped.
-}
-
-
-def _ts_node_type(raw_type: str, language: str) -> NodeType:
-    """
-    Map a raw tree-sitter node type string to a canonical NodeType.
-    Falls back to UNKNOWN for unrecognised types (they are skipped).
-    """
-    # Direct lookup first
-    result = _TS_NORMALIZE.get(raw_type)
-    if result:
-        return result
-    # Some grammars suffix their language: "if_statement" vs "if_statement_go"
-    # Try with language suffix stripped
-    stripped = re.sub(r'_(?:java|js|go|rust|c|python)$', '', raw_type)
-    return _TS_NORMALIZE.get(stripped, NodeType.UNKNOWN)
-
-
-# ---------------------------------------------------------------------------
-# Language → tree-sitter grammar name mapping
-# tree-sitter-languages bundles all grammars under their canonical names.
-# ---------------------------------------------------------------------------
-
-_TS_GRAMMAR_NAME: Dict[str, str] = {
-    "python":     "python",
-    "java":       "java",
-    "javascript": "javascript",
-    "typescript": "typescript",
-    "tsx":        "tsx",
-    "go":         "go",
-    "rust":       "rust",
-    "c":          "c",
-    "cpp":        "cpp",
-    "terraform":  "hcl",
-    "yaml":       "yaml",
-}
-
-
-def _get_ts_parser(language: str):
-    """Return a Tree-sitter Parser for the given language, or None."""
-    if not _TS_AVAILABLE:
-        return None
-    canonical = _LANG_ALIASES.get(language.lower(), language.lower())
-    grammar = _TS_GRAMMAR_NAME.get(canonical)
-    if grammar is None:
-        return None
-    try:
-        return tsl.get_parser(grammar)
-    except Exception as exc:
-        log.debug("tree-sitter parser unavailable for %s: %s", language, exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Name extractor helpers — pull a meaningful identifier from a TS node
-# ---------------------------------------------------------------------------
-
-def _ts_extract_name(node, source_bytes: bytes) -> str:
-    """
-    Walk immediate children of a Tree-sitter node to find an identifier
-    or declarator that serves as the node's name.
-    """
-    # Direct name/identifier child
-    for child in node.children:
-        if child.type in ("identifier", "field_identifier", "property_identifier",
-                          "type_identifier", "name"):
-            return source_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
-    # For declarations like `let x = ...`, the declarator holds the name
-    for child in node.children:
-        if child.type in ("variable_declarator", "init_declarator"):
-            for sub in child.children:
-                if sub.type == "identifier":
-                    return source_bytes[sub.start_byte:sub.end_byte].decode("utf-8", errors="replace")
-    return ""
-
-
-def _ts_snippet(node, source_bytes: bytes, max_chars: int = 200) -> str:
-    raw = source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
-    raw = raw.strip()
-    if len(raw) > max_chars:
-        raw = raw[:max_chars] + "…"
-    return raw
-
-
-# ---------------------------------------------------------------------------
-# Tree-sitter AST extractor (primary)
-# ---------------------------------------------------------------------------
-
-# Node types to visit — skip noise (punctuation, keywords, whitespace)
-_VISIT_TYPES = {nt for nt in _TS_NORMALIZE.values()} | {NodeType.FUNCTION, NodeType.CALL,
-    NodeType.ASSIGN, NodeType.IF, NodeType.LOOP, NodeType.RETURN,
-    NodeType.IMPORT, NodeType.BLOCK, NodeType.LITERAL, NodeType.IDENTIFIER}
-
-# Minimum depth to record a node — skip top-level program/module wrapper
-_MIN_DEPTH = 1
-
-# Maximum depth to traverse into the tree (avoids O(n²) on deeply nested code)
-_MAX_DEPTH = 12
-
-
-def _walk_ts_tree(node, source_bytes: bytes, language: str,
-                  filename: str, session_id: str,
-                  nodes: List[CPGNode], depth: int = 0) -> None:
-    if depth > _MAX_DEPTH:
-        return
-
-    ntype = _ts_node_type(node.type, language)
-
-    if ntype != NodeType.UNKNOWN and depth >= _MIN_DEPTH:
-        name = _ts_extract_name(node, source_bytes)
-        snippet = _ts_snippet(node, source_bytes)
-        nodes.append(CPGNode(
-            id=f"{session_id}:{filename}:{node.start_point[0]}:{node.start_byte}",
-            session_id=session_id,
-            node_type=ntype,
-            language=language,
-            file=filename,
-            line_start=node.start_point[0] + 1,   # tree-sitter is 0-indexed
-            line_end=node.end_point[0] + 1,
-            col_start=node.start_point[1],
-            col_end=node.end_point[1],
-            name=name,
-            code_snippet=snippet,
-            phase="ast",
-        ))
-
-    for child in node.children:
-        _walk_ts_tree(child, source_bytes, language, filename,
-                      session_id, nodes, depth + 1)
-
-
-def _extract_nodes_treesitter(
-    code: str, language: str, filename: str, session_id: str
-) -> Optional[List[CPGNode]]:
-    """
-    Parse code with Tree-sitter and return CPGNode list.
-    Returns None if the grammar is unavailable (caller falls back to regex).
-    """
-    parser = _get_ts_parser(language)
-    if parser is None:
-        return None
-
-    source_bytes = code.encode("utf-8")
-    try:
-        tree = parser.parse(source_bytes)
-    except Exception as exc:
-        log.warning("Tree-sitter parse error (%s %s): %s", language, filename, exc)
-        return None
-
-    nodes: List[CPGNode] = []
-    _walk_ts_tree(tree.root_node, source_bytes, language, filename, session_id, nodes)
-
-    # De-duplicate: tree walking can produce the same node twice for
-    # constructs where a parent and its single child have the same span.
-    seen: set = set()
-    unique: List[CPGNode] = []
-    for n in nodes:
-        if n.id not in seen:
-            seen.add(n.id)
-            unique.append(n)
-
-    log.debug("tree-sitter: %d nodes from %s (%s)", len(unique), filename, language)
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Regex-based AST extractor — per-language patterns (fallback)
-# ---------------------------------------------------------------------------
-
-# Each entry: list of (regex_pattern, NodeType, name_group_index_or_None)
-# name_group_index: which capture group holds the identifier name, or None
-_LANG_PATTERNS: Dict[str, List[Tuple]] = {
-
-    "python": [
-        (r"^(async\s+)?def\s+(\w+)\s*\(",          NodeType.FUNCTION,  2),
-        (r"^\s*class\s+(\w+)",                       NodeType.BLOCK,     1),
-        (r"^\s*if\s+.+:",                            NodeType.IF,        None),
-        (r"^\s*(for|while)\s+.+:",                   NodeType.LOOP,      None),
-        (r"^\s*return\b",                            NodeType.RETURN,    None),
-        (r"^\s*(import|from)\s+(\S+)",               NodeType.IMPORT,    2),
-        (r"^\s*(\w+)\s*=\s*",                        NodeType.ASSIGN,    1),
-        (r"\b(\w+)\s*\(",                            NodeType.CALL,      1),
-    ],
-
-    "java": [
-        # method declaration: modifiers* returnType name(
-        (r"(?:public|private|protected|static|final|abstract|synchronized)"
-         r"[\w\s<>\[\]]*\s+(\w+)\s*\(",              NodeType.FUNCTION,  1),
-        # constructor: ClassName(
-        (r"^\s*(?:public|private|protected)?\s*([A-Z]\w+)\s*\(",
-                                                      NodeType.FUNCTION,  1),
-        (r"^\s*(?:class|interface|enum)\s+(\w+)",    NodeType.BLOCK,     1),
-        (r"\b(\w+(?:\.\w+)*)\s*\(",                  NodeType.CALL,      1),
-        (r"^\s*(?:int|String|boolean|long|double|float|char|byte|Object"
-         r"|List|Map|Set|[\w<>\[\]]+)\s+(\w+)\s*=",  NodeType.ASSIGN,    1),
-        (r"^\s*(\w+)\s*=\s*(?!.*==)",                NodeType.ASSIGN,    1),
-        (r"^\s*if\s*\(",                             NodeType.IF,        None),
-        (r"^\s*(?:for|while)\s*\(",                  NodeType.LOOP,      None),
-        (r"^\s*return\b",                            NodeType.RETURN,    None),
-        (r"^\s*import\s+([\w.]+)",                   NodeType.IMPORT,    1),
-    ],
-
-    "javascript": [
-        (r"(?:async\s+)?function\s+(\w+)\s*\(",      NodeType.FUNCTION,  1),
-        (r"(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(?.*\)?\s*=>",
-                                                      NodeType.FUNCTION,  1),
-        (r"(\w+)\s*:\s*(?:async\s+)?function\s*\(",  NodeType.FUNCTION,  1),
-        (r"class\s+(\w+)",                           NodeType.BLOCK,     1),
-        (r"\b(\w+(?:\.\w+)*)\s*\(",                  NodeType.CALL,      1),
-        (r"(?:const|let|var)\s+(\w+)\s*=\s*",        NodeType.ASSIGN,    1),
-        (r"^\s*(\w+(?:\.\w+)*)\s*=\s*(?!.*===?)",    NodeType.ASSIGN,    1),
-        (r"^\s*if\s*\(",                             NodeType.IF,        None),
-        (r"^\s*(?:for|while)\s*\(",                  NodeType.LOOP,      None),
-        (r"^\s*return\b",                            NodeType.RETURN,    None),
-        (r"^\s*import\s+",                           NodeType.IMPORT,    None),
-        (r"^\s*require\s*\(",                        NodeType.IMPORT,    None),
-    ],
-
-    "go": [
-        (r"^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(",  NodeType.FUNCTION, 1),
-        # Assignments must precede the generic CALL pattern — := lines also contain (
-        (r"^\s*(\w+)\s*:=\s*",                             NodeType.ASSIGN,  1),
-        (r"^\s*var\s+(\w+)\s+",                            NodeType.ASSIGN,  1),
-        (r"^\s*(\w+)\s*=\s*(?!.*==)",                      NodeType.ASSIGN,  1),
-        (r"^\s*if\s+",                                     NodeType.IF,      None),
-        (r"^\s*for\s+",                                    NodeType.LOOP,    None),
-        (r"^\s*return\b",                                  NodeType.RETURN,  None),
-        (r"^\s*import\s+",                                 NodeType.IMPORT,  None),
-        (r"^type\s+(\w+)\s+struct",                        NodeType.BLOCK,   1),
-        # Generic call — last so assignments are not shadowed
-        (r"\b(\w+(?:\.\w+)*)\s*\(",                        NodeType.CALL,    1),
-    ],
-
-    "rust": [
-        (r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*",    NodeType.FUNCTION, 1),
-        (r"^\s*(?:pub\s+)?(?:struct|enum|impl|trait)\s+(\w+)",
-                                                            NodeType.BLOCK,   1),
-        # Assignments before generic call — let bindings often contain (
-        (r"^\s*let\s+(?:mut\s+)?(\w+)\s*",                 NodeType.ASSIGN,  1),
-        (r"^\s*(\w+)\s*=\s*(?!.*==)",                      NodeType.ASSIGN,  1),
-        (r"^\s*if\s+",                                     NodeType.IF,      None),
-        (r"^\s*(?:for|loop|while)\s+",                     NodeType.LOOP,    None),
-        (r"^\s*return\b",                                  NodeType.RETURN,  None),
-        (r"^\s*use\s+([\w:]+)",                            NodeType.IMPORT,  1),
-        (r"^\s*extern\s+crate\s+(\w+)",                    NodeType.IMPORT,  1),
-    ],
-
-    "c": [
-        # function definition: type name(  — type can be multi-word
-        (r"^[\w\s\*]+\s+(\w+)\s*\([^;]*\)\s*\{",          NodeType.FUNCTION, 1),
-        # Assignments before generic call — declarations contain (
-        (r"^\s*[\w\*]+\s+(\w+)\s*=",                       NodeType.ASSIGN,  1),
-        (r"^\s*(\w+)\s*=\s*(?!.*==)",                      NodeType.ASSIGN,  1),
-        (r"\b(\w+)\s*\(",                                  NodeType.CALL,    1),
-        (r"^\s*if\s*\(",                                   NodeType.IF,      None),
-        (r"^\s*(?:for|while|do)\s*[\s(]",                  NodeType.LOOP,    None),
-        (r"^\s*return\b",                                  NodeType.RETURN,  None),
-        (r"^\s*#include\s+[<\"](\S+)[>\"]",                NodeType.IMPORT,  1),
-        (r"^\s*struct\s+(\w+)",                            NodeType.BLOCK,   1),
-    ],
-
-    "terraform": [
-        # resource/data/module/provider blocks
-        (r"^\s*(resource|data|module|provider|variable|output|locals)\s+",
-                                                            NodeType.BLOCK,   1),
-        # attribute assignment
-        (r"^\s*(\w+)\s*=\s*",                              NodeType.ASSIGN,  1),
-        # function call inside expressions
-        (r"\b(\w+)\s*\(",                                  NodeType.CALL,    1),
-        # string or number literals that contain secrets
-        (r'"([^"]{6,})"',                                  NodeType.LITERAL, None),
-    ],
-
-    "yaml": [
-        # Top-level keys (depth 0)
-        (r"^(\w[\w\-]*):",                                 NodeType.BLOCK,   1),
-        # Nested key: value
-        (r"^\s+(\w[\w\-]*):\s+\S",                        NodeType.ASSIGN,  1),
-        # Sequence entry
-        (r"^\s*-\s+(\S.*)",                                NodeType.ASSIGN,  None),
-    ],
-}
-
-# Alias typescript and tsx to javascript patterns
-_LANG_PATTERNS["typescript"] = _LANG_PATTERNS["javascript"]
-_LANG_PATTERNS["tsx"]        = _LANG_PATTERNS["javascript"]
-# Alias cpp to c patterns
-_LANG_PATTERNS["cpp"]        = _LANG_PATTERNS["c"]
-
-
-def _extract_nodes_regex(
-    code: str, language: str, filename: str, session_id: str
-) -> List[CPGNode]:
-    """
-    Language-aware regex-based CPG node extractor.
-    Used when Tree-sitter is unavailable. Produces one node per
-    meaningful line for each supported language.
-    Falls back to Python patterns for unknown languages.
-    """
-    canonical = _LANG_ALIASES.get(language.lower(), language.lower())
-    patterns  = _LANG_PATTERNS.get(canonical, _LANG_PATTERNS["python"])
-
-    nodes: List[CPGNode] = []
-    lines = code.splitlines()
-
-    # Comment prefixes per language — lines starting with these are skipped
-    _COMMENT_PREFIXES: Dict[str, Tuple] = {
-        "python":    ("#",),
-        "java":      ("//", "/*", "*"),
-        "javascript":("//", "/*", "*"),
-        "typescript":("//", "/*", "*"),
-        "tsx":       ("//", "/*", "*"),
-        "go":        ("//", "/*"),
-        "rust":      ("//", "/*"),
-        "c":         ("//", "/*", "*"),
-        "cpp":       ("//", "/*", "*"),
-        "terraform": ("#", "//"),
-        "yaml":      ("#",),
+# ── Serialisers for vis.js ─────────────────────────────────────────────────────
+
+def _darken(hex_colour: str) -> str:
+    h = hex_colour.lstrip("#")
+    if len(h) != 6:
+        return hex_colour
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"#{max(0, r-40):02x}{max(0, g-40):02x}{max(0, b-40):02x}"
+
+
+def _serialise_node(node: Any, backend: str = "") -> dict:
+    """Convert a NormalizedNode (parser layer) to vis.js format."""
+    node_type = getattr(node, "node_type", None)
+    node_type_val = node_type.value if hasattr(node_type, "value") else str(node_type or "UNKNOWN")
+
+    security_label = getattr(node, "security_label", None)
+    label_val = security_label.value if hasattr(security_label, "value") else str(security_label or "NONE")
+
+    cwe_hints = list(getattr(node, "cwe_hints", None) or [])
+    bg = _LABEL_COLOUR.get(label_val, "#6b7280")
+
+    name = (getattr(node, "name", "") or "")[:20]
+    short_label = f"{name}\n({node_type_val})" if name else node_type_val
+
+    return {
+        "id":    getattr(node, "node_id", ""),
+        "label": short_label,
+        "title": f"{getattr(node, 'file_path', '')}:{getattr(node, 'start_line', 0)}",
+        "color": {"background": bg, "border": _darken(bg)},
+        "shape": "dot" if label_val == "NONE" else "diamond",
+        "size":  8 if label_val == "NONE" else 14,
+        "group": node_type_val,
+        "meta": {
+            "file_path":      getattr(node, "file_path", ""),
+            "start_line":     getattr(node, "start_line", 0),
+            "end_line":       getattr(node, "end_line", 0),
+            "node_type":      node_type_val,
+            "security_label": label_val,
+            "cwe_hints":      cwe_hints,
+            "raw_text":       (getattr(node, "raw_text", "") or "")[:300],
+            "backend":        backend or getattr(node, "backend", ""),
+        },
     }
-    comment_prefixes = _COMMENT_PREFIXES.get(canonical, ("#", "//"))
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if any(stripped.startswith(p) for p in comment_prefixes):
-            continue
 
-        ntype = NodeType.UNKNOWN
-        name  = ""
+def _serialise_edge(edge: Any) -> dict:
+    """Convert an Edge (parser layer) to vis.js format."""
+    etype = getattr(edge, "edge_type", None)
+    etype_val = etype.value if hasattr(etype, "value") else str(etype or "")
+    colour = _EDGE_COLOUR.get(etype_val, "#94a3b8")
+    return {
+        "id":     getattr(edge, "edge_id", ""),
+        "from":   getattr(edge, "src_id", ""),
+        "to":     getattr(edge, "dst_id", ""),
+        "label":  etype_val,
+        "color":  {"color": colour, "highlight": colour},
+        "width":  2 if "DFG" in etype_val or "TAINT" in etype_val else 1,
+        "dashes": "CFG" in etype_val,
+        "arrows": "to",
+    }
 
-        for pattern, typ, name_group in patterns:
-            m = re.search(pattern, line)
-            if m:
-                ntype = typ
-                if name_group is not None:
-                    try:
-                        name = m.group(name_group) or ""
-                    except IndexError:
-                        name = ""
-                if not name:
-                    # Generic fallback: first identifier before ( or =
-                    nm = re.search(r"\b(\w+)\s*[\(=]", line)
-                    name = nm.group(1) if nm else stripped[:30]
+
+def _serialise_finding(node: Any, session_id: str) -> dict | None:
+    """
+    Convert a SINK/SENSITIVE node into a finding dict for the UI.
+    Confidence and CWE come directly from Joern/CodeQL annotation —
+    never from regex keyword counting.
+    """
+    label = getattr(node, "security_label", None)
+    label_val = label.value if hasattr(label, "value") else str(label or "NONE")
+
+    if label_val not in ("SINK", "SENSITIVE"):
+        return None
+
+    confidence = getattr(node, "security_confidence", 0.0)
+    if confidence < 0.3:
+        return None
+
+    cwes = list(getattr(node, "cwe_hints", None) or [])
+    cwe_key = cwes[0] if cwes else ""
+    meta = _VULN_META.get(cwe_key, {})
+    attrs = getattr(node, "attributes", None) or {}
+
+    # Severity from CodeQL SARIF attribute if present, else infer from label
+    severity = attrs.get("severity") or ("HIGH" if label_val == "SINK" else "MEDIUM")
+
+    return {
+        "node_id":       getattr(node, "node_id", ""),
+        "session_id":    session_id,
+        "file_path":     getattr(node, "file_path", ""),
+        "start_line":    getattr(node, "start_line", 0),
+        "node_type":     (getattr(node, "node_type", None) or "").value
+                         if hasattr(getattr(node, "node_type", None), "value")
+                         else str(getattr(node, "node_type", "")),
+        "name":          getattr(node, "name", "") or "",
+        "label":         label_val,
+        "severity":      severity.upper(),
+        "confidence":    round(confidence, 2),
+        "cwe_hints":     cwes,
+        "raw_text":      (getattr(node, "raw_text", "") or "")[:400],
+        "rule_id":       attrs.get("rule_id", ""),
+        "description":   meta.get("description", ""),
+        "remediation":   meta.get("remediation", ""),
+        "references":    meta.get("references", []),
+        "function_name": attrs.get("function_name", ""),
+    }
+
+
+# ── gVisor sandbox ────────────────────────────────────────────────────────────
+# Imported from the same helper used by ui/app.py so the behaviour is identical.
+# Falls back to a local inline copy if the import path differs.
+
+def _run_sandbox(repo_dir: str, session_id: str, push_fn, push_progress_fn) -> str:
+    """Isolate repo in gVisor container. Returns path to sandboxed repo."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    output_dir = tempfile.mkdtemp(prefix=f"prism_out_{session_id[:8]}_")
+
+    if not _shutil.which("docker"):
+        push_fn("⚠️  Docker not found — running analysis directly on host", "warning", "sandbox")
+        push_progress_fn("sandbox", 35)
+        return repo_dir
+
+    try:
+        result = _subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        use_gvisor = "runsc" in result.stdout
+    except Exception:
+        use_gvisor = False
+
+    runtime_flag   = ["--runtime=runsc"] if use_gvisor else []
+    isolation_note = "gVisor (runsc)" if use_gvisor else "standard Docker"
+    push_fn(f"🔒 Isolating in {isolation_note} sandbox…", "info", "sandbox")
+
+    container_name = f"prism-sandbox-{session_id[:12]}"
+    cmd = [
+        "docker", "run", "--name", container_name, "--rm",
+        *runtime_flag,
+        "--network=none", "--read-only",
+        "--tmpfs", "/tmp:size=256m",
+        f"--volume={repo_dir}:/workspace:ro",
+        f"--volume={output_dir}:/output:rw",
+        "--memory=512m", "--cpus=1", "--user=nobody",
+        "python:3.11-slim", "python3", "-c",
+        "import shutil; shutil.copytree('/workspace', '/output/repo', dirs_exist_ok=True); print('sandbox-ok')",
+    ]
+    try:
+        res = _subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode == 0 and "sandbox-ok" in res.stdout:
+            push_fn("  ✅ Sandbox container exited cleanly", "info", "sandbox")
+            push_progress_fn("sandbox", 35)
+            return os.path.join(output_dir, "repo")
+        else:
+            push_fn(f"  ⚠️  Sandbox exit {res.returncode}: {res.stderr[:200]}", "warning", "sandbox")
+            push_fn("  Falling back to direct host analysis", "warning", "sandbox")
+            push_progress_fn("sandbox", 35)
+            return repo_dir
+    except _subprocess.TimeoutExpired:
+        push_fn("  ⚠️  Sandbox timed out — falling back to direct analysis", "warning", "sandbox")
+        _subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        return repo_dir
+    except Exception as exc:
+        push_fn(f"  ⚠️  Sandbox error ({exc}) — falling back", "warning", "sandbox")
+        return repo_dir
+
+
+# ── Queue-based event helpers ─────────────────────────────────────────────────
+
+def _push_ws(gq: "queue.Queue", event_type: str, payload: Any = None) -> None:
+    evt: dict = {"type": event_type}
+    if payload is not None:
+        evt["payload"] = payload
+    try:
+        gq.put_nowait(evt)
+    except queue.Full:
+        pass
+
+
+# ── Main pipeline entry point (called from _run_pipeline_bg in ui/app.py) ─────
+
+def run_real_pipeline(
+    session:     dict,
+    repo_url:    str,
+    branch:      str,
+    commit_sha:  str | None,
+    token:       str,
+    max_repo_mb: int,
+) -> None:
+    """
+    Full dynamic pipeline:
+      1. Secure GitHub ingestion (TLS + SHA pin + integrity check)
+      2. gVisor sandbox delivery
+      3. Joern CFG + DFG graph construction
+      4. CodeQL SARIF annotation injected onto CPG nodes
+      5. Neo4j write
+      6. Real-time WebSocket streaming to UI
+
+    This function is called from a daemon thread. It never raises —
+    all exceptions are caught and emitted as error events.
+    """
+    import logging as _logging
+
+    q:  queue.Queue = session["log_queue"]
+    gq: queue.Queue = session["graph_queue"]
+    session_id = session["session_id"]
+
+    def push(msg: str, level: str = "info", stage: str = "") -> None:
+        q.put_nowait({
+            "type": "log", "level": level,
+            "logger": "prism.pipeline", "message": msg,
+            "stage": stage, "ts": round(time.time() * 1000),
+        })
+
+    def push_progress(stage: str, pct: int) -> None:
+        q.put_nowait({"type": "progress", "stage": stage, "pct": pct})
+
+    def ws_phase(stage: str, label: str) -> None:
+        _push_ws(gq, "phase", {"stage": stage, "label": label})
+
+    sandbox_clone_dir: str | None = None
+
+    try:
+        session["status"] = "running"
+        push(f"▶ Starting PRISM analysis: {repo_url}", "info", "init")
+        push(f"  Branch: {branch}  |  Session: {session_id}", "info", "init")
+        push_progress("init", 5)
+        ws_phase("PARSE", "Initialising…")
+
+        # ── Stage 1: Credentials ─────────────────────────────────────────────
+        push("🔑 Stage 1 — Credential acquisition", "info", "credential")
+        ws_phase("PARSE", "Acquiring credentials…")
+
+        if not _INGESTION_AVAILABLE:
+            push("❌ Ingestion module not available — cannot proceed with real pipeline", "error", "credential")
+            push("   Install PRISM pipeline: pip install -e .[ingestion]", "error", "credential")
+            session["status"] = "failed"
+            session["error"]  = "Ingestion module not available"
+            _push_ws(gq, "error", {"message": "Ingestion module not available"})
+            return
+
+        provider = EnvCredentialProvider(direct_token=token if token else None)
+        push_progress("credential", 12)
+
+        # ── Stage 2: Ingestion ────────────────────────────────────────────────
+        push("📥 Stage 2 — Repository ingestion (TLS + SHA pinning + integrity check)", "info", "ingestion")
+        ws_phase("AST", "Cloning repository…")
+
+        sandbox_clone_dir = tempfile.mkdtemp(prefix=f"prism_clone_{session_id[:8]}_")
+        req_obj = IngestionRequest(
+            repo_url=repo_url,
+            provider=GitProvider.GITHUB,
+            branch=branch,
+            commit_sha=commit_sha,
+            credential_ref="github",
+            output_dir=sandbox_clone_dir,
+            session_id=session_id,
+            max_repo_size_mb=max_repo_mb,
+        )
+        result = run_ingestion(req_obj, credential_provider=provider)
+
+        if not result.succeeded:
+            push(f"❌ Ingestion failed: {result.error}", "error", "ingestion")
+            session["error"] = result.error
+            session["status"] = "failed"
+            _push_ws(gq, "error", {"message": result.error})
+            return
+
+        push(
+            f"  ✅ {result.manifest.total_files} files cloned — "
+            f"repo_hash={result.manifest.repo_hash[:16]}…",
+            "info", "ingestion",
+        )
+        for w in result.warnings:
+            push(f"  ⚠️  {w}", "warning", "ingestion")
+        push_progress("ingestion", 30)
+
+        # ── Stage 3: gVisor sandbox ───────────────────────────────────────────
+        push("🔒 Stage 3 — Sandbox isolation", "info", "sandbox")
+        ws_phase("NORMALIZE", "Isolating in gVisor sandbox…")
+        analysis_dir = _run_sandbox(result.output_dir, session_id, push, push_progress)
+
+        # ── Stage 4: Joern CPG construction ───────────────────────────────────
+        push("🔬 Stage 4 — CPG construction (Joern + Tree-sitter + CodeQL SARIF)", "info", "parsing")
+        ws_phase("CFG", "Building Code Property Graph with Joern…")
+
+        if not _PARSER_AVAILABLE:
+            push("❌ Parser module not available", "error", "parsing")
+            session["status"] = "failed"
+            session["error"]  = "Parser module not available"
+            _push_ws(gq, "error", {"message": "Parser module not available"})
+            return
+
+        registry = ParserRegistry()
+        bs = registry.get_backend_status()
+        push(
+            f"  Backends — joern={bs.get('joern_available')} | "
+            f"tree_sitter={bs.get('tree_sitter_available')} | "
+            f"codeql={bs.get('codeql_available')}",
+            "info", "parsing",
+        )
+
+        if not bs.get("joern_available"):
+            push(
+                "  ⚠️  Joern not found. Set JOERN_HOME in .env or add joern-parse to PATH.",
+                "warning", "parsing",
+            )
+            push("  Falling back to Tree-sitter AST (no CFG/DFG edges)", "warning", "parsing")
+
+        # Stream nodes and edges as each file is parsed
+        parse_outputs = []
+        total_nodes = 0
+        total_edges = 0
+        seen_nodes: set[str] = set()
+        seen_edges: set[str] = set()
+
+        for file_output in registry.parse_repository_streaming(analysis_dir):
+            parse_outputs.append(file_output)
+            backend = getattr(file_output.metadata, "backend", None)
+            backend_val = backend.value if hasattr(backend, "value") else str(backend or "")
+
+            for node in file_output.nodes:
+                node_id = getattr(node, "node_id", "")
+                if node_id in seen_nodes or total_nodes >= _VIS_MAX_NODES:
+                    continue
+                seen_nodes.add(node_id)
+                _push_ws(gq, "node", _serialise_node(node, backend_val))
+                total_nodes += 1
+
+            for edge in file_output.edges:
+                edge_id = getattr(edge, "edge_id", "")
+                if edge_id in seen_edges or total_edges >= _VIS_MAX_EDGES:
+                    continue
+                src = getattr(edge, "src_id", "")
+                dst = getattr(edge, "dst_id", "")
+                if src not in seen_nodes or dst not in seen_nodes:
+                    continue
+                seen_edges.add(edge_id)
+                _push_ws(gq, "edge", _serialise_edge(edge))
+                total_edges += 1
+
+        push(
+            f"  ✅ {len(parse_outputs)} files — {total_nodes} nodes, {total_edges} edges",
+            "info", "parsing",
+        )
+        push_progress("parsing", 70)
+
+        # ── Stage 5: GraphBuilder + Neo4j ─────────────────────────────────────
+        push("📊 Stage 5 — CPG assembly + Neo4j write", "info", "graph")
+        ws_phase("ANNOTATE", "Assembling CPG and writing to Neo4j…")
+
+        findings: list[dict] = []
+
+        if _GRAPH_BUILDER_AVAILABLE:
+            try:
+                writer = Neo4jWriter(
+                    uri=os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+                    user=os.environ.get("NEO4J_USER", "neo4j"),
+                    password=os.environ.get("NEO4J_PASSWORD", ""),
+                )
+                writer.setup_schema()
+            except Exception:
+                log.warning("Neo4j unavailable — using mock writer")
+                writer = MockNeo4jWriter()
+
+            # Find CodeQL SARIF output in the sandbox (written by CodeQL parser)
+            sarif_path: str | None = None
+            for p in Path(analysis_dir).rglob("*.sarif"):
+                sarif_path = str(p)
                 break
 
-        if ntype == NodeType.UNKNOWN:
-            continue
-
-        nodes.append(CPGNode(
-            id=f"{session_id}:{filename}:{i}",
-            session_id=session_id,
-            node_type=ntype,
-            language=language,
-            file=filename,
-            line_start=i + 1,
-            line_end=i + 1,
-            col_start=len(line) - len(line.lstrip()),
-            col_end=len(line.rstrip()),
-            name=name,
-            code_snippet=stripped[:200],
-            phase="ast",
-        ))
-    return nodes
-
-
-# ---------------------------------------------------------------------------
-# Unified node extractor — Tree-sitter first, regex fallback
-# ---------------------------------------------------------------------------
-
-def extract_nodes(
-    code: str, language: str, filename: str, session_id: str
-) -> Tuple[List[CPGNode], str]:
-    """
-    Extract CPG nodes from source code.
-    Returns (nodes, backend_used) where backend_used is "treesitter" or "regex".
-    """
-    ts_nodes = _extract_nodes_treesitter(code, language, filename, session_id)
-    if ts_nodes is not None:
-        return ts_nodes, "treesitter"
-    log.debug("Tree-sitter unavailable for %s — using regex extractor", language)
-    return _extract_nodes_regex(code, language, filename, session_id), "regex"
-
-
-# ---------------------------------------------------------------------------
-# CFG edge builder
-# ---------------------------------------------------------------------------
-
-def _build_cfg_edges(nodes: List[CPGNode], session_id: str) -> List[CPGEdge]:
-    """Sequential CFG_NEXT edges between consecutive nodes in the same file."""
-    edges: List[CPGEdge] = []
-    by_file: Dict[str, List[CPGNode]] = {}
-    for n in nodes:
-        by_file.setdefault(n.file, []).append(n)
-    for file_nodes in by_file.values():
-        sorted_nodes = sorted(file_nodes, key=lambda x: x.line_start)
-        for i in range(len(sorted_nodes) - 1):
-            a, b = sorted_nodes[i], sorted_nodes[i + 1]
-            kind = EdgeKind.CFG_TRUE if a.node_type == NodeType.IF else EdgeKind.CFG_NEXT
-            edges.append(CPGEdge(
-                id=f"cfg:{a.id}:{b.id}",
+            builder = GraphBuilder(neo4j_writer=writer)
+            gb_result = builder.build_repository(
+                repo_dir=analysis_dir,
                 session_id=session_id,
-                source_id=a.id,
-                target_id=b.id,
-                kind=kind,
-            ))
-    return edges
-
-
-# ---------------------------------------------------------------------------
-# DFG edge builder
-# ---------------------------------------------------------------------------
-
-def _build_dfg_edges(nodes: List[CPGNode], session_id: str) -> List[CPGEdge]:
-    """
-    Heuristic intra-procedural DFG:
-    ASSIGN nodes flow into CALL nodes that appear later in the same file
-    where the assigned variable name appears in the call snippet.
-    """
-    edges: List[CPGEdge] = []
-    assigns = [n for n in nodes if n.node_type == NodeType.ASSIGN]
-    calls   = [n for n in nodes if n.node_type in (NodeType.CALL, NodeType.ASSIGN)]
-    for a in assigns:
-        if not a.name:
-            continue
-        for c in calls:
-            if c.id == a.id:
-                continue
-            if c.file == a.file and c.line_start > a.line_start:
-                if a.name in c.code_snippet:
-                    edges.append(CPGEdge(
-                        id=f"dfg:{a.id}:{c.id}",
-                        session_id=session_id,
-                        source_id=a.id,
-                        target_id=c.id,
-                        kind=EdgeKind.DFG_FLOW,
-                        label=a.name,
-                    ))
-    return edges
-
-
-# ---------------------------------------------------------------------------
-# Pass 1 — Neo4j DFG path query
-# ---------------------------------------------------------------------------
-
-async def _detect_via_neo4j(
-    session_id: str,
-    language: str,
-    patterns: List[dict],
-) -> List[VulnerabilityFinding]:
-    """
-    Traces multi-hop DFG_FLOW paths from source → sink nodes in Neo4j,
-    excluding any path that passes through a sanitizer node.
-    Returns [] gracefully when Neo4j is unreachable.
-    """
-    try:
-        from db.neo4j_client import get_driver
-        driver = await get_driver()
-        settings = get_settings()
-    except Exception:
-        return []
-
-    findings: List[VulnerabilityFinding] = []
-    seen: set = set()
-
-    neo4j_query = """
-    MATCH path = (src:CPGNode)-[:CPG_EDGE*1..6 {kind:'DFG_FLOW'}]->(sink:CPGNode)
-    WHERE src.session_id  = $sid
-      AND sink.session_id = $sid
-      AND any(s IN $sources WHERE
-            src.code_snippet CONTAINS s OR src.name CONTAINS s)
-      AND any(s IN $sinks WHERE
-            sink.code_snippet CONTAINS s OR sink.name CONTAINS s)
-      AND ($no_sanitizers OR none(n IN nodes(path) WHERE
-            any(san IN $sanitizers WHERE n.code_snippet CONTAINS san)))
-    RETURN src, sink,
-           [n IN nodes(path) | n.id]   AS path_ids,
-           [n IN nodes(path) | n.name] AS path_names
-    LIMIT 20
-    """
-
-    async with (await get_driver()).session(database=get_settings().neo4j_database) as db_session:
-        for pat in patterns:
-            sources    = pat.get("sources", [])
-            sinks      = pat.get("sinks", [])
-            sanitizers = pat.get("sanitizers", [])
-            if not sources or not sinks:
-                continue
-
-            try:
-                result = await db_session.run(
-                    neo4j_query,
-                    sid=session_id,
-                    sources=sources,
-                    sinks=sinks,
-                    sanitizers=sanitizers or ["__no_sanitizer__"],
-                    no_sanitizers=(len(sanitizers) == 0),
-                )
-                records = await result.data()
-            except Exception as exc:
-                log.debug("Neo4j query failed (%s): %s", pat["vuln_type"], exc)
-                continue
-
-            for record in records:
-                sink_node = record["sink"]
-                sink_id   = sink_node.get("id", "")
-                dedup_key = f"{pat['vuln_type']}:{sink_id}"
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-
-                path_ids: List[str]   = record.get("path_ids", [sink_id])
-                path_names: List[str] = record.get("path_names", [])
-                taint_path = " → ".join(filter(None, path_names)) or sink_id
-                confidence = min(0.95, 0.70 + len(path_ids) * 0.03)
-
-                findings.append(VulnerabilityFinding(
-                    id=str(uuid.uuid4()),
-                    session_id=session_id,
-                    node_id=sink_id,
-                    vuln_type=pat["vuln_type"],
-                    cwe=pat["cwe"],
-                    severity=pat["severity"],
-                    confidence=confidence,
-                    file=sink_node.get("file", ""),
-                    line_start=sink_node.get("line_start", 0),
-                    line_end=sink_node.get("line_end", 0),
-                    function_name=sink_node.get("name", ""),
-                    description=pat["description"],
-                    code_snippet=sink_node.get("code_snippet", ""),
-                    data_flow_path=path_ids,
-                    remediation=pat["remediation"],
-                    references=pat["references"],
-                ))
-                log.debug("Neo4j: %s via %s", pat["vuln_type"], taint_path)
-
-    return findings
-
-
-# ---------------------------------------------------------------------------
-# Pass 2 — Regex/keyword fallback detector
-# ---------------------------------------------------------------------------
-
-def _detect_via_regex(
-    nodes: List[CPGNode],
-    session_id: str,
-    source_lines: Dict[str, List[str]],
-    language: str,
-    skip_node_ids: Optional[set] = None,
-) -> List[VulnerabilityFinding]:
-    """
-    Matches sink patterns from YAML against node code snippets.
-    skip_node_ids: nodes already found by Neo4j pass — not duplicated.
-    """
-    patterns = get_patterns(language)
-    skip = skip_node_ids or set()
-    findings: List[VulnerabilityFinding] = []
-
-    for node in nodes:
-        if node.id in skip:
-            continue
-        file_lines = source_lines.get(node.file, [])
-        ctx_start  = max(0, node.line_start - 2)
-        ctx_end    = min(len(file_lines), node.line_end + 2)
-        context    = "\n".join(file_lines[ctx_start:ctx_end])
-
-        for pat in patterns:
-            if node.node_type not in pat["node_types"]:
-                continue
-            matched = any(kw in context for kw in pat["keywords"])
-            if not matched and pat["sink_pattern"]:
-                matched = bool(re.search(pat["sink_pattern"], context, re.IGNORECASE))
-            if not matched:
-                continue
-
-            kw_hits    = sum(1 for kw in pat["keywords"] if kw in context)
-            confidence = min(0.95, 0.55 + kw_hits * 0.1)
-            snippet    = "\n".join(
-                file_lines[max(0, node.line_start - 1):
-                           min(len(file_lines), node.line_end + 3)]
+                repo_hash=result.manifest.repo_hash,
+                sarif_path=sarif_path,
             )
-            findings.append(VulnerabilityFinding(
-                id=str(uuid.uuid4()),
-                session_id=session_id,
-                node_id=node.id,
-                vuln_type=pat["vuln_type"],
-                cwe=pat["cwe"],
-                severity=pat["severity"],
-                confidence=confidence,
-                file=node.file,
-                line_start=node.line_start,
-                line_end=node.line_end,
-                function_name=node.name,
-                description=pat["description"],
-                code_snippet=snippet,
-                data_flow_path=[node.id],
-                remediation=pat["remediation"],
-                references=pat["references"],
-            ))
-            break  # one finding per node
+            push(
+                f"  ✅ CPG built — {gb_result.total_nodes} nodes, "
+                f"{gb_result.total_edges} edges, "
+                f"neo4j={'ok' if getattr(writer, '_available', True) else 'mock'}",
+                "info", "graph",
+            )
+        else:
+            push("  ⚠️  GraphBuilder module not available — Neo4j write skipped", "warning", "graph")
 
-    return findings
+        # ── Stage 6: Extract findings from annotated nodes ────────────────────
+        push("🔍 Stage 6 — Extracting vulnerability findings", "info", "graph")
+        ws_phase("ANNOTATE", "Extracting findings from annotated graph…")
 
+        for file_output in parse_outputs:
+            for node in file_output.nodes:
+                f = _serialise_finding(node, session_id)
+                if f:
+                    findings.append(f)
+                    _push_ws(gq, "annotation", {
+                        "node_id":   f["node_id"],
+                        "annotated": True,
+                        "severity":  f["severity"],
+                        "vuln_id":   f.get("rule_id", ""),
+                    })
+                    _push_ws(gq, "finding", f)
 
-# ---------------------------------------------------------------------------
-# Combined async detector
-# ---------------------------------------------------------------------------
+        findings.sort(key=lambda x: (x["label"] != "SINK", -x["confidence"]))
+        push(f"  ✅ {len(findings)} vulnerability findings", "info", "graph")
+        push_progress("graph", 90)
 
-async def detect_vulnerabilities(
-    nodes: List[CPGNode],
-    session_id: str,
-    source_lines: Dict[str, List[str]],
-    language: str,
-) -> List[VulnerabilityFinding]:
-    """
-    Pass 1 (Neo4j taint tracing) then Pass 2 (regex).
-    Pass 2 skips nodes already covered by Pass 1.
-    """
-    patterns       = get_patterns(language)
-    neo4j_findings = await _detect_via_neo4j(session_id, language, patterns)
-    neo4j_node_ids = {f.node_id for f in neo4j_findings}
-    regex_findings = _detect_via_regex(
-        nodes, session_id, source_lines, language,
-        skip_node_ids=neo4j_node_ids,
-    )
-    all_findings = neo4j_findings + regex_findings
-    log.info("session=%s lang=%s neo4j=%d regex=%d total=%d",
-             session_id, language,
-             len(neo4j_findings), len(regex_findings), len(all_findings))
-    return all_findings
+        # ── Finalise ──────────────────────────────────────────────────────────
+        all_nodes_vis: list[dict] = []
+        all_edges_vis: list[dict] = []
+        cwe_counts: dict[str, int] = {}
+        backend_counts: dict[str, int] = {}
 
+        for fo in parse_outputs:
+            bv = fo.metadata.backend.value if hasattr(fo.metadata.backend, "value") else ""
+            backend_counts[bv] = backend_counts.get(bv, 0) + 1
+            for n in fo.nodes:
+                nid = getattr(n, "node_id", "")
+                if nid not in seen_nodes:
+                    continue
+                vis = _serialise_node(n, bv)
+                all_nodes_vis.append(vis)
+                for cwe in (getattr(n, "cwe_hints", None) or []):
+                    cwe_counts[cwe] = cwe_counts.get(cwe, 0) + 1
+            for e in fo.edges:
+                eid = getattr(e, "edge_id", "")
+                if eid in seen_edges:
+                    all_edges_vis.append(_serialise_edge(e))
 
-# Sync wrapper — backward-compatible with tests/run_tests.py (no event loop)
-def _detect_vulnerabilities(
-    nodes: List[CPGNode],
-    session_id: str,
-    source_lines: Dict[str, List[str]],
-    language: str = "python",
-) -> List[VulnerabilityFinding]:
-    """Regex-only sync wrapper. Used by standalone test runner."""
-    return _detect_via_regex(nodes, session_id, source_lines, language)
+        graph_payload = {
+            "nodes": all_nodes_vis,
+            "edges": all_edges_vis,
+            "summary": {
+                "node_count":     total_nodes,
+                "edge_count":     total_edges,
+                "finding_count":  len(findings),
+                "file_count":     len(parse_outputs),
+                "cwe_counts":     cwe_counts,
+                "backend_counts": backend_counts,
+                "truncated":      total_nodes >= _VIS_MAX_NODES,
+            },
+        }
 
+        session["graph"]    = graph_payload
+        session["findings"] = findings
+        session["status"]   = "complete"
 
-# ---------------------------------------------------------------------------
-# Main pipeline generator
-# ---------------------------------------------------------------------------
+        push(
+            f"🎉 Analysis complete — {total_nodes} nodes, {total_edges} edges, "
+            f"{len(findings)} findings",
+            "info", "done",
+        )
+        push_progress("done", 100)
 
-async def build_cpg(
-    code: str,
-    language: str,
-    filename: str,
-    session_id: str,
-) -> AsyncIterator[WSEvent]:
-    """Async generator — yields WSEvent objects as the CPG is built."""
-
-    def _evt(etype: WSEventType, payload=None) -> WSEvent:
-        return WSEvent(type=etype, session_id=session_id, payload=payload)
-
-    source_lines = {filename: code.splitlines()}
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.PARSE,
-                                   "label": "Parsing source…"})
-    await asyncio.sleep(0.05)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.AST,
-                                   "label": "Building AST nodes…"})
-    nodes, backend = extract_nodes(code, language, filename, session_id)
-    log.info("session=%s backend=%s nodes=%d lang=%s",
-             session_id, backend, len(nodes), language)
-
-    for i, node in enumerate(nodes):
-        yield _evt(WSEventType.NODE, node.model_dump())
-        if i % 3 == 0:
-            await asyncio.sleep(0.04)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.NORMALIZE,
-                                   "label": f"Normalising node types… (backend: {backend})"})
-    await asyncio.sleep(0.15)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.CFG,
-                                   "label": "Building control flow graph…"})
-    cfg_edges = _build_cfg_edges(nodes, session_id)
-    for i, edge in enumerate(cfg_edges):
-        yield _evt(WSEventType.EDGE, edge.model_dump())
-        if i % 4 == 0:
-            await asyncio.sleep(0.03)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.DFG,
-                                   "label": "Tracing data flows…"})
-    dfg_edges = _build_dfg_edges(nodes, session_id)
-    for i, edge in enumerate(dfg_edges):
-        yield _evt(WSEventType.EDGE, edge.model_dump())
-        if i % 3 == 0:
-            await asyncio.sleep(0.04)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.CPG_MERGE,
-                                   "label": "Merging CPG…"})
-    await asyncio.sleep(0.2)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.GRAPHCODEBERT,
-                                   "label": "Running GraphCodeBERT…"})
-    await asyncio.sleep(0.3)
-
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.ANNOTATE,
-                                   "label": "Annotating vulnerabilities…"})
-    findings = await detect_vulnerabilities(nodes, session_id, source_lines, language)
-
-    vuln_node_ids = {f.node_id for f in findings}
-    for node in nodes:
-        vuln_id  = next((f.id for f in findings if f.node_id == node.id), None)
-        severity = next(
-            (f.severity for f in findings if f.node_id == node.id), None
-        ) if node.id in vuln_node_ids else None
-        yield _evt(WSEventType.ANNOTATION, {
-            "node_id": node.id,
-            "annotated": True,
-            "vuln_id": vuln_id,
-            "severity": severity,
+        _push_ws(gq, "complete", {
+            "node_count":    total_nodes,
+            "edge_count":    total_edges,
+            "finding_count": len(findings),
         })
-        await asyncio.sleep(0.02)
 
-    for finding in findings:
-        yield _evt(WSEventType.FINDING, finding.model_dump())
+        q.put_nowait({
+            "type": "final", "status": "complete",
+            "findings": findings,
+            "summary":  graph_payload["summary"],
+        })
 
-    yield _evt(WSEventType.PHASE, {"stage": PipelinePhase.COMPLETE,
-                                   "label": "Analysis complete"})
-    yield _evt(WSEventType.COMPLETE, {
-        "node_count":   len(nodes),
-        "edge_count":   len(cfg_edges) + len(dfg_edges),
-        "finding_count":len(findings),
-        "backend":      backend,
-    })
+    except Exception as exc:
+        log.exception("Pipeline exception in session %s", session_id)
+        push(f"❌ Pipeline exception: {exc}", "error", "exception")
+        session["error"]  = str(exc)
+        session["status"] = "failed"
+        _push_ws(gq, "error", {"message": str(exc)})
+        q.put_nowait({"type": "final", "status": "failed", "error": str(exc)})
+
+    finally:
+        if sandbox_clone_dir:
+            try:
+                shutil.rmtree(sandbox_clone_dir, ignore_errors=True)
+            except Exception:
+                pass

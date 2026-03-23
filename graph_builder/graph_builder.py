@@ -622,14 +622,19 @@ class FileCPGBuilder:
         Uses the existing parser.security_annotator if available,
         otherwise uses inline heuristics.
         """
+        # Only apply regex fallback classification to nodes that were NOT
+        # already annotated by Joern or the CodeQL SARIF injector.
+        # Joern/CodeQL annotations take precedence — never overwrite them.
         for node in cpg_file.nodes:
-            if node.node_type != NodeType.CALL:
-                continue
-
-            call_name = node.raw_text.strip().split("(")[0].strip()
-            label = _classify_call_security(call_name, cpg_file.language.value)
-            if label != SecurityLabel.NONE:
-                node.security_label = label
+            if node.node_type == NodeType.CALL and node.raw_text:
+                # Skip if already annotated by a real analysis backend
+                existing = getattr(node, "security_label", None)
+                existing_val = existing.value if hasattr(existing, "value") else str(existing or "")
+                if existing_val not in ("NONE", "", None):
+                    continue   # ← Joern/CodeQL already set this — do not overwrite
+                label = _classify_call_security(node.raw_text, cpg_file.language.value)
+                if label != SecurityLabel.NONE:
+                    node.security_label = label
 
 
 # Security sink/source classification

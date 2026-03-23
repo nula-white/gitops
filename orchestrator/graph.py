@@ -1,64 +1,29 @@
 """
-PRISM Pipeline Orchestrator  —  LangGraph implementation
+PRISM Pipeline Orchestrator  —  complete implementation
 =========================================================
-Architecture
-------------
-The pipeline is a directed graph of nodes (stages).  Each node is a pure
-function that:
-  1. Reads from PipelineState
-  2. Does work
-  3. Returns a *partial* PipelineState dict (LangGraph merges it back)
 
-LangGraph handles:
-  - State persistence between nodes
-  - Conditional edge routing (route_after_ingestion, route_after_hitl1)
-  - Interrupt-and-resume for HITL checkpoints
+Bug fixes applied:
+  BUG-02  node_ingestion hardcoded GitProvider.GITHUB
+          → provider now detected from URL via AdapterRegistry
 
-Pipeline graph:
+  BUG-03  node_cpg_build used os.environ.get() for Neo4j config
+          → replaced with get_settings()
 
-    START
-      │
-    [ingestion]          ← Stage 1: clone, verify, deliver to sandbox
-      │
-    route_after_ingestion ─── FAILED ──► [handle_failure]
-      │ OK                                     │
-    [parsing]            ← Stage 2: Joern/Tree-sitter/fallback parse      │
-      │                                        │
-    [cpg_build]          ← Stage 3: assemble CPG, write Neo4j             │
-      │                                        │
-    [sarif_annotation]   ← Stage 4: inject CodeQL SARIF into CPG          │
-      │                                        │
-    [hitl1_checkpoint]   ← HITL-1: pause for human review                 │
-      │                                        │
-    route_after_hitl1 ─── REJECTED ──► [handle_failure]                   │
-      │ APPROVED                               │                           │
-    [emit_audit]         ← Stage 5: blockchain audit log                  │
-      │                                        ▼                          │
-    END ◄────────────────────────────── [end_node] ◄──────────────────────┘
+  BUG-04  node_sarif_annotation only counted results, never injected
+          → now rebuilds node_index from Neo4j, calls SARIFInjector,
+            writes annotated nodes + taint edges back to Neo4j
 
-Extension points
-----------------
-Future stages are added between [hitl1_checkpoint] and [emit_audit]:
-  - [vulnerability_analysis]   SecurityAnalysisAgent
-  - [iac_generation]           IaCGenerationAgent
-  - [hitl2_checkpoint]         HITL-2 before IaC deployment
-  - [redteam]                  RedTeamAgent
+  BUG-06  CodeQL called per-file inside parser, not at repo level
+          → node_codeql_analysis runs CodeQL once per repository
 
-Each is just a new node + edge in the same graph.
+New stages:
+  node_tool_health_check  (Stage 0)
+  node_codeql_analysis    (Stage 3.5)
 
-Usage
------
-    from prism.orchestrator import run_pipeline
-
-    result = run_pipeline(
-        repo_url       = "https://github.com/owner/repo",
-        branch         = "main",
-        credential_ref = "github/myorg/myrepo",   # Vault path or env key
-        output_dir     = "/tmp/prism_sandbox",
-    )
-    print(result["status"])           # "complete" | "failed" | "hitl_wait"
-    print(result["cpg_node_count"])
-    print(result["stage_results"])    # full audit trail
+Streaming events:
+  Every long-running stage emits progress events via
+  core.pipeline_events.emit() so the WebSocket frontend shows
+  live progress even during the 5-30 min CodeQL analysis.
 """
 
 from __future__ import annotations
@@ -72,8 +37,6 @@ from typing import Any, Literal
 
 logger = logging.getLogger("prism.orchestrator")
 
-# ── LangGraph imports (graceful import error to keep codebase runnable
-#    even when langgraph is not installed yet) ────────────────────────────────
 try:
     from langgraph.graph import StateGraph, END
     from langgraph.checkpoint.memory import MemorySaver
@@ -82,7 +45,7 @@ except ImportError:
     _LANGGRAPH_AVAILABLE = False
     logger.warning(
         "langgraph not installed — orchestrator will run in sequential "
-        "fallback mode.  Install with: pip install langgraph langchain"
+        "fallback mode.  Install with: pip install langgraph"
     )
 
 from .state import PipelineState, PipelineStatus, StageResult
@@ -91,17 +54,109 @@ from .state import PipelineState, PipelineStatus, StageResult
 # Helpers
 
 def _timer() -> float:
-    return time.monotonic() * 1000   # milliseconds
+    return time.monotonic() * 1000
 
 
-def _append_stage(
-    state: PipelineState,
-    result: StageResult,
-) -> dict:
-    """Return a state slice that appends a StageResult to stage_results."""
+def _append_stage(state: PipelineState, result: StageResult) -> dict:
     existing = list(state.get("stage_results", []))
     existing.append(result.to_dict())
     return {"stage_results": existing}
+
+
+def _emit(session_id: str, stage: str, label: str, data: dict | None = None) -> None:
+    """
+    Emit a phase event into the pipeline event bus.
+    No-op if no bus is registered (sequential fallback, tests).
+    """
+    try:
+        from backend.core.pipeline_events import emit_phase
+        emit_phase(session_id, stage, label)
+    except Exception:
+        pass   # event bus is optional — never crash a pipeline stage
+
+
+# Stage 0 — Tool health check
+
+def node_tool_health_check(state: PipelineState) -> dict:
+    """
+    Check all four tools BEFORE any pipeline work.
+
+    POLICY: all enabled tools are required.
+      Vault   — always required (exception: dev mode with PRISM_GIT_TOKEN)
+      Neo4j   — always required
+      Joern   — required when enable_joern=True
+      CodeQL  — required when enable_codeql=True
+
+    Collects ALL failures into one message so the operator sees
+    everything that needs fixing in a single run.
+    """
+    t0 = _timer()
+    session_id = state.get("session_id", "?")
+    logger.info("[Stage 0] Tool health check — session=%s", session_id)
+    _emit(session_id, "tool_health_check", "Checking tool availability...")
+
+    try:
+        from backend.core.tool_registry import check_tools
+        result = check_tools()
+        result.log_summary()
+        summary = result.summary()
+
+        failures = result.failing_required
+
+        if failures:
+            lines = [f"  • {t.name}: {t.reason}" for t in failures]
+            full_error = (
+                f"{len(failures)} required tool(s) unavailable:\n"
+                + "\n".join(lines)
+            )
+            logger.error("[Stage 0] %s", full_error)
+            sr = StageResult(
+                stage="tool_health_check", status="failed",
+                duration_ms=_timer() - t0,
+                summary=full_error,
+                error=full_error,
+                warnings=[t.reason for t in failures],
+            )
+            return {
+                "status":        PipelineStatus.FAILED,
+                "error":         full_error,
+                "tool_status":   summary,
+                "tool_warnings": [t.reason for t in failures],
+                **_append_stage(state, sr),
+            }
+
+        availability = "  ".join(
+            f"{n}={'✓' if s['available'] else '✗(disabled)'}"
+            for n, s in summary.items()
+        )
+        sr = StageResult(
+            stage="tool_health_check", status="ok",
+            duration_ms=_timer() - t0,
+            summary=f"All required tools healthy: {availability}",
+        )
+        _emit(session_id, "tool_health_check",
+              f"Tools ready: {availability}")
+        return {
+            "tool_status":   summary,
+            "tool_warnings": [],
+            **_append_stage(state, sr),
+        }
+
+    except Exception as exc:
+        logger.exception("[Stage 0] Health check exception")
+        error_msg = f"Tool health check failed: {exc}"
+        sr = StageResult(
+            stage="tool_health_check", status="failed",
+            duration_ms=_timer() - t0,
+            summary=error_msg, error=error_msg,
+        )
+        return {
+            "status":        PipelineStatus.FAILED,
+            "error":         error_msg,
+            "tool_status":   {},
+            "tool_warnings": [str(exc)],
+            **_append_stage(state, sr),
+        }
 
 
 # Stage 1 — Ingestion
@@ -110,28 +165,34 @@ def node_ingestion(state: PipelineState) -> dict:
     """
     Clone the repository, verify integrity, deliver to sandbox.
 
-    Reads:  repo_url, branch, commit_sha, credential_ref, output_dir, max_repo_mb
-    Writes: ingestion_status, repo_hash, fetched_commit, sandbox_path,
-            total_files, ingestion_warnings
+    BUG-02 FIX: provider detected from URL via AdapterRegistry,
+    not hardcoded to GitProvider.GITHUB.
     """
     t0 = _timer()
-    logger.info("[Stage 1] Ingestion starting — session=%s url=%s",
-                state.get("session_id"), state.get("repo_url"))
+    session_id = state.get("session_id", "?")
+    repo_url   = state.get("repo_url", "")
+    logger.info("[Stage 1] Ingestion — session=%s url=%s", session_id, repo_url)
+    _emit(session_id, "ingestion", f"Cloning {repo_url} @ {state.get('branch', 'main')}...")
 
     try:
         from ..ingestion.pipeline import run_ingestion
-        from ..ingestion.models import GitProvider, IngestionRequest
+        from ..ingestion.models import IngestionRequest
+
+        # BUG-02 FIX: detect provider from URL
+        provider = _detect_provider(repo_url)
 
         request = IngestionRequest(
-            repo_url        = state["repo_url"],
-            provider        = GitProvider.GITHUB,
-            branch          = state.get("branch", "main"),
-            commit_sha      = state.get("commit_sha"),
-            credential_ref  = state.get("credential_ref", "github"),
-            output_dir      = state.get("output_dir", "/tmp/prism_sandbox"),
-            session_id      = state.get("session_id"),
-            max_repo_size_mb= state.get("max_repo_mb", 100),
+            repo_url         = repo_url,
+            provider         = provider,
+            branch           = state.get("branch", "main"),
+            commit_sha       = state.get("commit_sha"),
+            credential_ref   = state.get("credential_ref", "github"),
+            output_dir       = state.get("output_dir", "/tmp/prism_sandbox"),
+            session_id       = session_id,
+            max_repo_size_mb = state.get("max_repo_mb", 100),
         )
+
+        _emit(session_id, "ingestion", "Verifying repository integrity...")
         result = run_ingestion(request)
 
         if not result.succeeded:
@@ -144,30 +205,29 @@ def node_ingestion(state: PipelineState) -> dict:
             )
             return {
                 "ingestion_status": "failed",
-                "status": PipelineStatus.FAILED,
-                "error": result.error,
+                "status":           PipelineStatus.FAILED,
+                "error":            result.error,
                 **_append_stage(state, sr),
             }
+
+        summary = (
+            f"Ingested {result.manifest.total_files} files "
+            f"from {repo_url} @ {result.manifest.fetched_commit[:12]}"
+        )
+        _emit(session_id, "ingestion", summary)
+        logger.info("[Stage 1] %s", summary)
 
         sr = StageResult(
             stage="ingestion", status="ok",
             duration_ms=_timer() - t0,
-            summary=(
-                f"Ingested {result.manifest.total_files} files "
-                f"from {state['repo_url']} "
-                f"@ {result.manifest.fetched_commit[:12]}"
-            ),
-            warnings=result.warnings,
+            summary=summary, warnings=result.warnings,
         )
-        logger.info("[Stage 1] Ingestion OK — %d files repo_hash=%s…",
-                    result.manifest.total_files, result.manifest.repo_hash[:16])
-
         return {
-            "ingestion_status": "ok",
-            "repo_hash":        result.manifest.repo_hash,
-            "fetched_commit":   result.manifest.fetched_commit,
-            "sandbox_path":     result.output_dir,
-            "total_files":      result.manifest.total_files,
+            "ingestion_status":   "ok",
+            "repo_hash":          result.manifest.repo_hash,
+            "fetched_commit":     result.manifest.fetched_commit,
+            "sandbox_path":       result.output_dir,
+            "total_files":        result.manifest.total_files,
             "ingestion_warnings": result.warnings,
             **_append_stage(state, sr),
         }
@@ -177,45 +237,48 @@ def node_ingestion(state: PipelineState) -> dict:
         sr = StageResult(
             stage="ingestion", status="failed",
             duration_ms=_timer() - t0,
-            summary=f"Ingestion exception: {exc}",
-            error=str(exc),
+            summary=str(exc), error=str(exc),
         )
         return {
             "ingestion_status": "failed",
-            "status": PipelineStatus.FAILED,
-            "error": str(exc),
+            "status":           PipelineStatus.FAILED,
+            "error":            str(exc),
             **_append_stage(state, sr),
         }
+
+
+def _detect_provider(repo_url: str):
+    """Detect GitProvider from URL; falls back to GENERIC on any error."""
+    try:
+        from ..ingestion.adapters.base import AdapterRegistry
+        return AdapterRegistry().get_adapter(repo_url).provider()
+    except Exception as exc:
+        logger.warning(
+            "Provider detection failed for %s: %s — using GENERIC",
+            repo_url, exc,
+        )
+        from ..ingestion.models import GitProvider
+        return GitProvider.GENERIC
 
 
 # Stage 2 — Parsing
 
 def node_parsing(state: PipelineState) -> dict:
     """
-    Parse every file in the sandbox using Joern → Tree-sitter → fallback.
-
-    Reads:  sandbox_path
-    Writes: parsing_status, parse_outputs (serialised), backend_used, parsing_warnings
+    Parse every file in the sandbox via Joern → Tree-sitter → fallback.
     """
     t0 = _timer()
-    sandbox = state.get("sandbox_path", "")
-    logger.info("[Stage 2] Parsing starting — sandbox=%s", sandbox)
+    sandbox    = state.get("sandbox_path", "")
+    session_id = state.get("session_id", "?")
+    logger.info("[Stage 2] Parsing — sandbox=%s", sandbox)
+    _emit(session_id, "parsing", "Building AST/CPG for repository files...")
 
     try:
         from ..parser.registry import ParserRegistry
 
-        registry = ParserRegistry()
-        backend_status = registry.get_backend_status()
-        logger.info(
-            "[Stage 2] Backends — joern=%s tree_sitter=%s codeql=%s",
-            backend_status.get("joern_available"),
-            backend_status.get("tree_sitter_available"),
-            backend_status.get("codeql_available"),
-        )
+        registry       = ParserRegistry()
+        parse_outputs  = registry.parse_repository(sandbox)
 
-        parse_outputs = registry.parse_repository(sandbox)
-
-        # Tally which backend handled each file
         backend_counts: dict[str, int] = {}
         warnings: list[str] = []
         for out in parse_outputs:
@@ -223,8 +286,9 @@ def node_parsing(state: PipelineState) -> dict:
             backend_counts[b] = backend_counts.get(b, 0) + 1
             warnings.extend(out.warnings)
 
-        # Serialise outputs (keep only metadata + counts — raw nodes are
-        # large; they are stored in Neo4j and accessed via graph_builder)
+        total_nodes = sum(len(o.nodes) for o in parse_outputs)
+        total_edges = sum(len(o.edges) for o in parse_outputs)
+
         serialised = [
             {
                 "file_path":   out.metadata.file_path,
@@ -238,27 +302,21 @@ def node_parsing(state: PipelineState) -> dict:
             for out in parse_outputs
         ]
 
-        total_nodes = sum(len(o.nodes) for o in parse_outputs)
-        total_edges = sum(len(o.edges) for o in parse_outputs)
+        summary = (
+            f"Parsed {len(parse_outputs)} files — "
+            f"{total_nodes} nodes, {total_edges} edges — "
+            f"backends: {backend_counts}"
+        )
+        _emit(session_id, "parsing", summary)
+        logger.info("[Stage 2] %s", summary)
+
+        _store_parse_outputs(session_id, parse_outputs)
 
         sr = StageResult(
             stage="parsing", status="ok",
             duration_ms=_timer() - t0,
-            summary=(
-                f"Parsed {len(parse_outputs)} files — "
-                f"{total_nodes} nodes, {total_edges} edges — "
-                f"backends: {backend_counts}"
-            ),
-            warnings=warnings[:50],   # cap warnings stored in state
+            summary=summary, warnings=warnings[:50],
         )
-        logger.info("[Stage 2] Parsing OK — %d files %d nodes %d edges",
-                    len(parse_outputs), total_nodes, total_edges)
-
-        # Stash full ParsedGraphOutput list for the CPG stage to consume.
-        # We use a module-level cache keyed by session_id to avoid
-        # serialising large objects into LangGraph state.
-        _store_parse_outputs(state.get("session_id", ""), parse_outputs)
-
         return {
             "parsing_status":   "ok",
             "parse_outputs":    serialised,
@@ -272,13 +330,12 @@ def node_parsing(state: PipelineState) -> dict:
         sr = StageResult(
             stage="parsing", status="failed",
             duration_ms=_timer() - t0,
-            summary=f"Parsing exception: {exc}",
-            error=str(exc),
+            summary=str(exc), error=str(exc),
         )
         return {
             "parsing_status": "failed",
-            "status": PipelineStatus.FAILED,
-            "error": str(exc),
+            "status":         PipelineStatus.FAILED,
+            "error":          str(exc),
             **_append_stage(state, sr),
         }
 
@@ -287,36 +344,36 @@ def node_parsing(state: PipelineState) -> dict:
 
 def node_cpg_build(state: PipelineState) -> dict:
     """
-    Assemble the Code Property Graph from parse outputs and write to Neo4j.
+    Assemble the CPG from parse outputs and write to Neo4j.
 
-    Reads:  sandbox_path, session_id, repo_hash, (cached parse_outputs)
-    Writes: cpg_status, cpg_node_count, cpg_edge_count, cpg_file_count,
-            neo4j_written, cpg_warnings, cpg_sarif_path
+    BUG-03 FIX: Neo4j connection parameters from get_settings(),
+    not os.environ.get() calls.
     """
     t0 = _timer()
-    session_id = state.get("session_id", "")
-    logger.info("[Stage 3] CPG build starting — session=%s", session_id)
+    session_id = state.get("session_id", "?")
+    logger.info("[Stage 3] CPG build — session=%s", session_id)
+    _emit(session_id, "cpg_build", "Assembling Code Property Graph...")
 
     try:
         from ..graph_builder.graph_builder import GraphBuilder
-        from ..graph_builder.neo4j_writer  import Neo4jWriter, MockNeo4jWriter
-        from ..parser.language_detector import detect_language
+        from ..graph_builder.neo4j_writer import Neo4jWriter, MockNeo4jWriter
 
-        # Connect to Neo4j (falls back to mock when unavailable)
+        # BUG-03 FIX: read from get_settings()
+        from backend.core.config import get_settings
+        s = get_settings()
+
         try:
             writer = Neo4jWriter(
-                uri      = os.environ.get("NEO4J_URI",  "bolt://localhost:7687"),
-                user     = os.environ.get("NEO4J_USER", "neo4j"),
-                password = os.environ.get("NEO4J_PASSWORD", "password"),
+                uri      = s.neo4j_uri,
+                user     = s.neo4j_user,
+                password = s.neo4j_password,
             )
             writer.setup_schema()
-        except Exception:
-            logger.warning("[Stage 3] Neo4j unavailable — using mock writer")
+        except Exception as e:
+            logger.warning("[Stage 3] Neo4j unavailable (%s) — using mock writer", e)
             writer = MockNeo4jWriter()
 
-        builder = GraphBuilder(neo4j_writer=writer)
-
-        # Retrieve parse outputs from the module-level cache
+        builder      = GraphBuilder(neo4j_writer=writer)
         parse_outputs = _load_parse_outputs(session_id)
         sandbox       = state.get("sandbox_path", "")
         repo_hash     = state.get("repo_hash", "")
@@ -328,49 +385,40 @@ def node_cpg_build(state: PipelineState) -> dict:
         for parsed in parse_outputs:
             file_path = str(Path(sandbox) / parsed.metadata.file_path)
             language  = parsed.metadata.language
-
-            # Read source bytes from sandbox
             try:
                 source_bytes = Path(file_path).read_bytes()
             except OSError:
                 source_bytes = b""
 
-            # Pass the ParsedGraphOutput so Joern edges are preserved
             cpg_file = builder._file_builder.build(
                 file_path     = file_path,
                 source_bytes  = source_bytes,
                 language      = language,
                 repo_root     = sandbox,
-                parsed_output = parsed,    # ← Joern-overwrite fix
+                parsed_output = parsed,
             )
             all_nodes += len(cpg_file.nodes)
             all_edges += len(cpg_file.edges)
             warnings.extend(cpg_file.warnings)
 
-        # Write all nodes + edges to Neo4j (or mock)
         write_result = writer.write(
-            nodes      = [],   # nodes already written per-file in full pipeline
-            edges      = [],
-            session_id = session_id,
-            repo_hash  = repo_hash,
+            nodes=[], edges=[], session_id=session_id, repo_hash=repo_hash,
         )
-        neo4j_ok = not bool(write_result.errors) if hasattr(write_result, "errors") else True
+        neo4j_ok = not bool(getattr(write_result, "errors", None))
 
-        # Look for a SARIF file left by CodeQL in the sandbox
-        sarif_path = _find_sarif(sandbox)
+        summary = (
+            f"CPG built — {len(parse_outputs)} files, "
+            f"{all_nodes} nodes, {all_edges} edges, "
+            f"neo4j={'ok' if neo4j_ok else 'mock'}"
+        )
+        _emit(session_id, "cpg_build", summary)
+        logger.info("[Stage 3] %s", summary)
 
         sr = StageResult(
             stage="cpg_build", status="ok",
             duration_ms=_timer() - t0,
-            summary=(
-                f"CPG built — {len(parse_outputs)} files, "
-                f"{all_nodes} nodes, {all_edges} edges, "
-                f"neo4j={'ok' if neo4j_ok else 'mock'}"
-            ),
-            warnings=warnings[:50],
+            summary=summary, warnings=warnings[:50],
         )
-        logger.info("[Stage 3] CPG build OK — %d nodes %d edges", all_nodes, all_edges)
-
         return {
             "cpg_status":     "ok",
             "cpg_node_count": all_nodes,
@@ -378,7 +426,6 @@ def node_cpg_build(state: PipelineState) -> dict:
             "cpg_file_count": len(parse_outputs),
             "neo4j_written":  neo4j_ok,
             "cpg_warnings":   warnings[:50],
-            "cpg_sarif_path": sarif_path,
             **_append_stage(state, sr),
         }
 
@@ -387,103 +434,394 @@ def node_cpg_build(state: PipelineState) -> dict:
         sr = StageResult(
             stage="cpg_build", status="failed",
             duration_ms=_timer() - t0,
-            summary=f"CPG build exception: {exc}",
-            error=str(exc),
+            summary=str(exc), error=str(exc),
         )
         return {
             "cpg_status": "failed",
-            "status": PipelineStatus.FAILED,
-            "error": str(exc),
+            "status":     PipelineStatus.FAILED,
+            "error":      str(exc),
             **_append_stage(state, sr),
         }
 
 
-# Stage 4 — SARIF Annotation
+# Stage 3.5 — CodeQL Analysis  (BUG-06 FIX + streaming events)
+
+def node_codeql_analysis(state: PipelineState) -> dict:
+    """
+    Run CodeQL database create + analyze at the repository level.
+    Produces a SARIF file for the sarif_annotation stage.
+
+    BUG-06 FIX: CodeQL now runs once per REPOSITORY (not per file inside
+    the parser registry).  The parser never calls CodeQL for structural
+    parsing — CodeQL is a security oracle only.
+
+    No timeout: CodeQL runs until it finishes, however long that takes.
+    Progress events are emitted at each milestone so the frontend
+    shows live status throughout the analysis.
+    """
+    t0 = _timer()
+    session_id = state.get("session_id", "?")
+    sandbox    = state.get("sandbox_path", "")
+
+    tool_status = state.get("tool_status", {})
+    codeql_ok   = tool_status.get("codeql", {}).get("available", False)
+
+    if not codeql_ok:
+        logger.info("[Stage 3.5] CodeQL not available — skipping")
+        _emit(session_id, "codeql_analysis",
+              "CodeQL skipped (not available or disabled)")
+        sr = StageResult(
+            stage="codeql_analysis", status="skipped",
+            duration_ms=_timer() - t0,
+            summary="CodeQL unavailable or disabled",
+        )
+        return {
+            "codeql_status":     "skipped",
+            "codeql_sarif_path": None,
+            "cpg_sarif_path":    None,
+            "codeql_warnings":   [],
+            **_append_stage(state, sr),
+        }
+
+    logger.info("[Stage 3.5] CodeQL analysis — sandbox=%s", sandbox)
+
+    try:
+        from ..parser.parsers.codeql_parser import CodeQLParser
+        from backend.core.config import get_settings
+        import tempfile as tf
+
+        s = get_settings()
+
+        # Detect primary language
+        primary_lang = _detect_primary_language(sandbox)
+        logger.info("[Stage 3.5] Primary language: %s", primary_lang.value)
+
+        # SARIF output path — outside the ephemeral CodeQL temp dir
+        sarif_path = os.path.join(
+            tf.gettempdir(),
+            f"prism_codeql_{session_id[:12]}.sarif"
+        )
+
+        parser = CodeQLParser(
+            codeql_cli_path    = s.codeql_cli_path or None,
+            codeql_search_path = s.codeql_search_path or None,
+        )
+
+        # Emit milestone events (emitted from inside CodeQLParser via
+        # the session_id passed through to _run_analysis)
+        _emit(session_id, "codeql_analysis",
+              f"CodeQL: creating database for {primary_lang.value} repository...")
+
+        result = parser.parse_repository(
+            repo_path         = sandbox,
+            language          = primary_lang,
+            sarif_output_path = sarif_path,
+            session_id        = session_id,   # used for event emission
+        )
+
+        sarif_exists = os.path.exists(sarif_path)
+
+        if sarif_exists:
+            import json
+            with open(sarif_path) as f:
+                sarif_data = json.load(f)
+            finding_count = sum(
+                len(run.get("results", []))
+                for run in sarif_data.get("runs", [])
+            )
+            summary = (
+                f"CodeQL analysis complete — "
+                f"{finding_count} security findings detected"
+            )
+        else:
+            summary = "CodeQL ran but produced no SARIF output"
+
+        _emit(session_id, "codeql_analysis", summary)
+        logger.info("[Stage 3.5] %s", summary)
+
+        sr = StageResult(
+            stage="codeql_analysis",
+            status="ok" if sarif_exists else "failed",
+            duration_ms=_timer() - t0,
+            summary=summary,
+            warnings=(result.warnings[:20] if result else []),
+        )
+        return {
+            "codeql_status":     "ok" if sarif_exists else "failed",
+            "codeql_sarif_path": sarif_path if sarif_exists else None,
+            "cpg_sarif_path":    sarif_path if sarif_exists else None,
+            "codeql_warnings":   (result.warnings[:20] if result else []),
+            **_append_stage(state, sr),
+        }
+
+    except Exception as exc:
+        logger.warning("[Stage 3.5] CodeQL failed (non-fatal): %s", exc)
+        _emit(session_id, "codeql_analysis",
+              f"CodeQL analysis failed: {exc}")
+        sr = StageResult(
+            stage="codeql_analysis", status="failed",
+            duration_ms=_timer() - t0,
+            summary=str(exc), error=str(exc),
+        )
+        return {
+            "codeql_status":     "failed",
+            "codeql_sarif_path": None,
+            "cpg_sarif_path":    None,
+            "codeql_warnings":   [str(exc)],
+            **_append_stage(state, sr),
+        }
+
+
+def _detect_primary_language(sandbox_path: str):
+    """Count file extensions; return the most common parseable Language."""
+    try:
+        from collections import Counter
+        from ..parser.language_detector import LanguageDetector
+        from ..parser.models import Language
+
+        detector = LanguageDetector()
+        counts: Counter = Counter()
+        for root, dirs, files in os.walk(sandbox_path):
+            dirs[:] = [d for d in dirs if d not in
+                       (".git", "node_modules", "__pycache__", ".terraform")]
+            for f in files:
+                r = detector.detect(os.path.join(root, f))
+                if r.language not in (Language.UNKNOWN, Language.YAML,
+                                      Language.TERRAFORM_HCL):
+                    counts[r.language] += 1
+
+        if counts:
+            return counts.most_common(1)[0][0]
+        return Language.PYTHON
+
+    except Exception as exc:
+        logger.warning("Language detection failed: %s — defaulting to Python", exc)
+        from ..parser.models import Language
+        return Language.PYTHON
+
+
+# Stage 4 — SARIF Annotation  (BUG-04 FIX + streaming events)
 
 def node_sarif_annotation(state: PipelineState) -> dict:
     """
-    Inject CodeQL SARIF findings into the CPG nodes.
+    Inject CodeQL SARIF security labels into CPG nodes stored in Neo4j.
 
-    Reads:  cpg_sarif_path, session_id
-    Writes: sarif_status, sarif_annotations, sarif_warnings
+    BUG-04 FIX — complete rewrite of this stage:
+      1. Load SARIF JSON from the path written by node_codeql_analysis.
+      2. Rebuild node_index ({(file, line, col): CPGNode}) from Neo4j.
+      3. Call SARIFInjector.inject() to annotate nodes in memory.
+      4. Write annotated nodes + taint edges back to Neo4j.
+
+    Previously: only counted SARIF results, never called SARIFInjector,
+    never wrote anything to Neo4j.  The SARIFInjector was dead code.
     """
     t0 = _timer()
-    sarif_path = state.get("cpg_sarif_path")
+    session_id = state.get("session_id", "?")
+    sarif_path = (
+        state.get("cpg_sarif_path")
+        or state.get("codeql_sarif_path")
+    )
 
-    if not sarif_path:
-        logger.info("[Stage 4] No SARIF file found — skipping SARIF annotation")
+    if not sarif_path or not os.path.exists(str(sarif_path)):
+        logger.info("[Stage 4] No SARIF file — skipping annotation")
+        _emit(session_id, "sarif_annotation",
+              "SARIF annotation skipped (no CodeQL output)")
         sr = StageResult(
             stage="sarif_annotation", status="skipped",
             duration_ms=_timer() - t0,
-            summary="No SARIF file available (CodeQL not installed or not run)",
+            summary="No SARIF file available",
         )
-        return {"sarif_status": "skipped", "sarif_annotations": 0,
-                **_append_stage(state, sr)}
+        return {
+            "sarif_status":      "skipped",
+            "sarif_annotations": 0,
+            "sarif_edges":       0,
+            "sarif_warnings":    [],
+            **_append_stage(state, sr),
+        }
 
-    logger.info("[Stage 4] SARIF annotation — file=%s", sarif_path)
+    logger.info("[Stage 4] SARIF annotation — session=%s", session_id)
+    _emit(session_id, "sarif_annotation",
+          "Loading SARIF results and building node index...")
+
     try:
         from ..graph_builder.sarif_injector import SARIFInjector
-
-        injector = SARIFInjector()
-        # Node index is rebuilt from Neo4j in the full SecurityAnalysisAgent;
-        # here we do a lightweight count-only pass to record the finding count.
+        from ..graph_builder.neo4j_writer import Neo4jWriter
+        from backend.core.config import get_settings
         import json
+
+        s = get_settings()
+
+        # Step 1: Load SARIF
         with open(sarif_path) as f:
             sarif_data = json.load(f)
 
-        annotation_count = sum(
+        total_findings = sum(
             len(run.get("results", []))
             for run in sarif_data.get("runs", [])
         )
+        _emit(session_id, "sarif_annotation",
+              f"Injecting {total_findings} SARIF findings into CPG nodes...")
+
+        # Step 2: Rebuild node_index from Neo4j
+        node_index = _build_node_index_from_neo4j(session_id, s)
+        logger.info(
+            "[Stage 4] Node index: %d entries from Neo4j", len(node_index)
+        )
+        if not node_index:
+            logger.warning(
+                "[Stage 4] Node index empty — Neo4j may be down; "
+                "SARIF annotations will not be persisted"
+            )
+
+        # Step 3: Inject
+        new_edges: list = []
+        injection_result = SARIFInjector().inject(
+            sarif_data = sarif_data,
+            node_index = node_index,
+            edges      = new_edges,
+            repo_root  = state.get("sandbox_path", ""),
+        )
+
+        _emit(
+            session_id, "sarif_annotation",
+            f"Annotated {injection_result.annotations_added} CPG nodes — "
+            f"writing {injection_result.edges_added} taint edges to Neo4j...",
+        )
+
+        # Step 4: Write annotated nodes + taint edges back to Neo4j
+        from ..graph_builder.models import SecurityLabel
+
+        annotated_nodes = [
+            n for n in node_index.values()
+            if getattr(n, "security_label", None) not in
+            (None, "", SecurityLabel.NONE)
+        ]
+
+        if annotated_nodes or new_edges:
+            try:
+                writer = Neo4jWriter(
+                    uri      = s.neo4j_uri,
+                    user     = s.neo4j_user,
+                    password = s.neo4j_password,
+                )
+                writer.write(
+                    nodes      = annotated_nodes,
+                    edges      = new_edges,
+                    session_id = session_id,
+                    repo_hash  = state.get("repo_hash", ""),
+                )
+                writer.close()
+                logger.info(
+                    "[Stage 4] Wrote %d annotated nodes + %d taint edges to Neo4j",
+                    len(annotated_nodes), len(new_edges),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Stage 4] Neo4j write for SARIF annotations failed "
+                    "(non-fatal): %s", exc
+                )
+
+        summary = (
+            f"SARIF injection complete — "
+            f"{injection_result.annotations_added} node annotations, "
+            f"{injection_result.edges_added} taint edges, "
+            f"{len(set(injection_result.rules_matched))} unique CWE rules matched"
+        )
+        _emit(session_id, "sarif_annotation", summary)
+        logger.info("[Stage 4] %s", summary)
 
         sr = StageResult(
             stage="sarif_annotation", status="ok",
             duration_ms=_timer() - t0,
-            summary=f"SARIF read: {annotation_count} findings from CodeQL",
+            summary=summary,
+            warnings=injection_result.warnings[:20],
         )
-        logger.info("[Stage 4] SARIF annotation OK — %d findings", annotation_count)
-
         return {
             "sarif_status":      "ok",
-            "sarif_annotations": annotation_count,
-            "sarif_warnings":    [],
+            "sarif_annotations": injection_result.annotations_added,
+            "sarif_edges":       injection_result.edges_added,
+            "sarif_warnings":    injection_result.warnings[:20],
             **_append_stage(state, sr),
         }
 
     except Exception as exc:
         logger.warning("[Stage 4] SARIF annotation failed (non-fatal): %s", exc)
+        _emit(session_id, "sarif_annotation",
+              f"SARIF annotation failed: {exc}")
         sr = StageResult(
             stage="sarif_annotation", status="failed",
             duration_ms=_timer() - t0,
-            summary=f"SARIF annotation failed (non-fatal): {exc}",
-            error=str(exc),
+            summary=str(exc), error=str(exc),
         )
         return {
             "sarif_status":      "failed",
             "sarif_annotations": 0,
+            "sarif_edges":       0,
             "sarif_warnings":    [str(exc)],
             **_append_stage(state, sr),
         }
 
 
+def _build_node_index_from_neo4j(session_id: str, settings) -> dict:
+    """
+    Query Neo4j for all CPGNodes in this session.
+    Returns {(file_path, start_line, start_col): CPGNode}.
+    Falls back to empty dict if Neo4j is unavailable.
+    """
+    from ..graph_builder.models import CPGNode, NodeType, Language, SecurityLabel
+    node_index: dict = {}
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(
+            settings.neo4j_uri,
+            auth=(settings.neo4j_user, settings.neo4j_password),
+            connection_timeout=settings.neo4j_timeout_s,
+        )
+        with driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                """
+                MATCH (n:CPGNode {session_id: $sid})
+                RETURN n.node_id    AS node_id,
+                       n.node_type  AS node_type,
+                       n.file_path  AS file_path,
+                       n.start_line AS start_line,
+                       n.start_col  AS start_col,
+                       n.end_line   AS end_line,
+                       n.end_col    AS end_col,
+                       n.language   AS language
+                """,
+                sid=session_id,
+            )
+            for rec in result:
+                try:
+                    nt   = NodeType(rec["node_type"]) if rec["node_type"] else NodeType.UNKNOWN
+                    lang = Language(rec["language"]) if rec["language"] else Language.UNKNOWN
+                    node = CPGNode(
+                        node_id    = rec["node_id"],
+                        node_type  = nt,
+                        language   = lang,
+                        file_path  = rec["file_path"] or "",
+                        start_line = int(rec["start_line"] or 0),
+                        end_line   = int(rec["end_line"] or 0),
+                        start_col  = int(rec["start_col"] or 0),
+                        end_col    = int(rec["end_col"] or 0),
+                    )
+                    node_index[(node.file_path, node.start_line, node.start_col)] = node
+                except Exception:
+                    continue
+        driver.close()
+    except Exception as exc:
+        logger.warning("[Stage 4] Could not build node_index from Neo4j: %s", exc)
+    return node_index
+
+
 # HITL-1 checkpoint
 
 def node_hitl1_checkpoint(state: PipelineState) -> dict:
-    """
-    Human-in-the-loop checkpoint after CPG construction.
-
-    In LangGraph, this node raises Interrupt to pause execution.
-    The caller resumes by invoking graph.invoke() again with
-    hitl1_approved=True/False in the state update.
-
-    When running without LangGraph (sequential fallback mode), this node
-    auto-approves if the environment variable PRISM_HITL_AUTOAPPROVE=1 is
-    set — useful for CI pipelines.
-    """
     t0 = _timer()
+    session_id = state.get("session_id", "?")
     already_decided = state.get("hitl1_approved")
 
-    # Already decided in a previous resume — pass through
     if already_decided is True:
         sr = StageResult(
             stage="hitl1", status="ok",
@@ -505,7 +843,6 @@ def node_hitl1_checkpoint(state: PipelineState) -> dict:
             **_append_stage(state, sr),
         }
 
-    # Auto-approve in CI / test environments
     if os.environ.get("PRISM_HITL_AUTOAPPROVE", "0") == "1":
         logger.info("[HITL-1] Auto-approved (PRISM_HITL_AUTOAPPROVE=1)")
         sr = StageResult(
@@ -515,204 +852,159 @@ def node_hitl1_checkpoint(state: PipelineState) -> dict:
         )
         return {"hitl1_approved": True, **_append_stage(state, sr)}
 
-    # Pause and wait for human decision
     logger.info(
-        "[HITL-1] Pausing for human review. "
-        "Resume with hitl1_approved=True to continue or False to abort.\n"
-        "  CPG: %d nodes, %d edges\n"
-        "  SARIF findings: %d\n"
-        "  Warnings: %d",
+        "[HITL-1] Pausing for human review — "
+        "CPG: %d nodes/%d edges  SARIF: %d annotations/%d taint edges",
         state.get("cpg_node_count", 0),
         state.get("cpg_edge_count", 0),
         state.get("sarif_annotations", 0),
-        len(state.get("cpg_warnings", [])),
+        state.get("sarif_edges", 0),
     )
+    _emit(session_id, "hitl1_checkpoint",
+          "Awaiting operator approval (send hitl_decision via WebSocket)...")
 
     if _LANGGRAPH_AVAILABLE:
         from langgraph.errors import NodeInterrupt
         raise NodeInterrupt(
-            "HITL-1: Review CPG construction results and resume with "
-            "hitl1_approved=True or hitl1_approved=False."
+            "HITL-1: Review CPG and SARIF results. "
+            "Resume with hitl1_approved=True or hitl1_approved=False."
         )
-
-    # Fallback: mark as waiting (the caller must poll)
     return {"status": PipelineStatus.HITL_WAIT}
 
 
-# Stage 5 — Audit log emission
+# Stage 5 — Audit
 
 def node_emit_audit(state: PipelineState) -> dict:
-    """
-    Emit the audit event to the blockchain logger.
-
-    Currently logs to prism.audit logger (consumed by the blockchain module
-    when web3 is installed).  This node is deliberately thin — the blockchain
-    integration lives in a separate module.
-
-    Reads:  session_id, repo_hash, fetched_commit, stage_results
-    Writes: status=complete
-    """
     t0 = _timer()
+    session_id = state.get("session_id", "?")
     import json
-
     event = {
-        "event_type":   "PIPELINE_COMPLETE",
-        "session_id":   state.get("session_id"),
-        "repo_hash":    state.get("repo_hash"),
-        "commit":       state.get("fetched_commit"),
-        "cpg_nodes":    state.get("cpg_node_count", 0),
-        "cpg_edges":    state.get("cpg_edge_count", 0),
-        "sarif_findings": state.get("sarif_annotations", 0),
-        "stages":       [s["stage"] for s in state.get("stage_results", [])],
+        "event_type":        "PIPELINE_COMPLETE",
+        "session_id":        session_id,
+        "repo_hash":         state.get("repo_hash"),
+        "commit":            state.get("fetched_commit"),
+        "cpg_nodes":         state.get("cpg_node_count", 0),
+        "cpg_edges":         state.get("cpg_edge_count", 0),
+        "sarif_annotations": state.get("sarif_annotations", 0),
+        "sarif_edges":       state.get("sarif_edges", 0),
+        "tools": {
+            k: v.get("available")
+            for k, v in state.get("tool_status", {}).items()
+        },
+        "stages": [s["stage"] for s in state.get("stage_results", [])],
     }
-    audit_log = logging.getLogger("prism.audit")
-    audit_log.info("AUDIT_EVENT %s", json.dumps(event))
-    logger.info("[Stage 5] Audit event emitted — session=%s", state.get("session_id"))
+    logging.getLogger("prism.audit").info("AUDIT_EVENT %s", json.dumps(event))
+    _emit(session_id, "audit",
+          f"Audit event emitted — repo_hash={state.get('repo_hash', '')[:16]}...")
+    logger.info("[Stage 5] Audit emitted — session=%s", session_id)
 
     sr = StageResult(
         stage="audit", status="ok",
         duration_ms=_timer() - t0,
-        summary="Audit event emitted to prism.audit logger",
+        summary="Audit event emitted",
     )
-    return {
-        "status": PipelineStatus.COMPLETE,
-        **_append_stage(state, sr),
-    }
+    return {"status": PipelineStatus.COMPLETE, **_append_stage(state, sr)}
 
-
-# Failure handler
 
 def node_handle_failure(state: PipelineState) -> dict:
-    """
-    Terminal failure node.  Logs the error and marks the pipeline as failed.
-    Ensures a consistent terminal state regardless of which stage failed.
-    """
-    error = state.get("error", "Unknown error")
-    logger.error("[FAILED] Pipeline failed — session=%s error=%s",
-                 state.get("session_id"), error)
+    logger.error(
+        "[FAILED] session=%s error=%s",
+        state.get("session_id"), state.get("error", "unknown"),
+    )
     return {"status": PipelineStatus.FAILED}
 
 
-# Routing functions  (conditional edges)
+# Routing functions
 
-def route_after_ingestion(state: PipelineState) -> Literal["parsing", "handle_failure"]:
-    """Route to parsing on success, to handle_failure on ingestion error."""
+def route_after_health_check(
+    state: PipelineState,
+) -> Literal["ingestion", "handle_failure"]:
+    if state.get("status") == PipelineStatus.FAILED:
+        return "handle_failure"
+    return "ingestion"
+
+
+def route_after_ingestion(
+    state: PipelineState,
+) -> Literal["parsing", "handle_failure"]:
     if state.get("ingestion_status") == "ok":
         return "parsing"
     return "handle_failure"
 
 
-def route_after_hitl1(state: PipelineState) -> Literal["emit_audit", "handle_failure"]:
-    """Route to audit emission on HITL approval, to failure on rejection."""
+def route_after_hitl1(
+    state: PipelineState,
+) -> Literal["emit_audit", "handle_failure"]:
     if state.get("hitl1_approved") is True:
         return "emit_audit"
     if state.get("status") == PipelineStatus.HITL_WAIT:
-        # Not yet decided — keep waiting (LangGraph handles interrupt)
-        return "emit_audit"    # unreachable during interrupt; satisfies type
+        return "emit_audit"   # unreachable during interrupt; satisfies type
     return "handle_failure"
 
 
 # Graph construction
 
 def build_pipeline_graph(checkpointer=None):
-    """
-    Construct and compile the LangGraph pipeline graph.
-
-    Args:
-        checkpointer: LangGraph checkpointer (default: MemorySaver for dev).
-                      Pass None to get an uncompiled graph for testing.
-
-    Returns:
-        Compiled LangGraph CompiledStateGraph, or a sequential runner
-        when langgraph is not installed.
-    """
+    """Build and compile the full PRISM pipeline graph."""
     if not _LANGGRAPH_AVAILABLE:
-        logger.warning(
-            "LangGraph not available — returning sequential fallback runner."
-        )
         return _SequentialFallbackRunner()
 
     graph = StateGraph(PipelineState)
 
-    # ── Register nodes ──────────────────────────────────────────────────────
-    graph.add_node("ingestion",        node_ingestion)
-    graph.add_node("parsing",          node_parsing)
-    graph.add_node("cpg_build",        node_cpg_build)
-    graph.add_node("sarif_annotation", node_sarif_annotation)
-    graph.add_node("hitl1_checkpoint", node_hitl1_checkpoint)
-    graph.add_node("emit_audit",       node_emit_audit)
-    graph.add_node("handle_failure",   node_handle_failure)
+    graph.add_node("tool_health_check",  node_tool_health_check)
+    graph.add_node("ingestion",          node_ingestion)
+    graph.add_node("parsing",            node_parsing)
+    graph.add_node("cpg_build",          node_cpg_build)
+    graph.add_node("codeql_analysis",    node_codeql_analysis)
+    graph.add_node("sarif_annotation",   node_sarif_annotation)
+    graph.add_node("hitl1_checkpoint",   node_hitl1_checkpoint)
+    graph.add_node("emit_audit",         node_emit_audit)
+    graph.add_node("handle_failure",     node_handle_failure)
 
-    # ── Edges ───────────────────────────────────────────────────────────────
-    graph.set_entry_point("ingestion")
+    graph.set_entry_point("tool_health_check")
 
-    # Conditional: ingestion → parsing OR handle_failure
+    graph.add_conditional_edges(
+        "tool_health_check",
+        route_after_health_check,
+        {"ingestion": "ingestion", "handle_failure": "handle_failure"},
+    )
     graph.add_conditional_edges(
         "ingestion",
         route_after_ingestion,
         {"parsing": "parsing", "handle_failure": "handle_failure"},
     )
-
-    # Linear: parsing → cpg_build → sarif_annotation → hitl1_checkpoint
-    graph.add_edge("parsing",          "cpg_build")
-    graph.add_edge("cpg_build",        "sarif_annotation")
-    graph.add_edge("sarif_annotation", "hitl1_checkpoint")
-
-    # Conditional: hitl1 → emit_audit OR handle_failure
+    graph.add_edge("parsing",         "cpg_build")
+    graph.add_edge("cpg_build",       "codeql_analysis")
+    graph.add_edge("codeql_analysis", "sarif_annotation")
+    graph.add_edge("sarif_annotation","hitl1_checkpoint")
     graph.add_conditional_edges(
         "hitl1_checkpoint",
         route_after_hitl1,
         {"emit_audit": "emit_audit", "handle_failure": "handle_failure"},
     )
-
-    # Both terminal nodes → END
     graph.add_edge("emit_audit",     END)
     graph.add_edge("handle_failure", END)
 
-    # ── Compile with interrupt point at HITL-1 ──────────────────────────────
     cp = checkpointer or MemorySaver()
     return graph.compile(
-        checkpointer          = cp,
-        interrupt_before      = ["hitl1_checkpoint"],
+        checkpointer     = cp,
+        interrupt_before = ["hitl1_checkpoint"],
     )
 
 
 # High-level entry point
 
 def run_pipeline(
-    repo_url:       str,
-    branch:         str         = "main",
-    commit_sha:     str | None  = None,
-    credential_ref: str         = "github",
-    output_dir:     str         = "/tmp/prism_sandbox",
-    max_repo_mb:    int         = 100,
-    session_id:     str | None  = None,
-    auto_approve_hitl: bool     = False,
+    repo_url:          str,
+    branch:            str        = "main",
+    commit_sha:        str | None = None,
+    credential_ref:    str        = "github",
+    output_dir:        str        = "/tmp/prism_sandbox",
+    max_repo_mb:       int        = 100,
+    session_id:        str | None = None,
+    auto_approve_hitl: bool       = False,
 ) -> PipelineState:
-    """
-    Run the full PRISM pipeline synchronously.
-
-    This is the primary entry point for:
-      - The Flask UI (`ui/app.py`)
-      - Tests
-      - The CLI (future)
-
-    For async / streaming execution, use `build_pipeline_graph()` directly
-    and call `graph.stream()`.
-
-    Args:
-        repo_url:          Repository to analyse.
-        branch:            Git branch.
-        commit_sha:        Specific commit to pin (None = HEAD).
-        credential_ref:    Vault path or env key for the GitHub token.
-        output_dir:        Sandbox delivery directory.
-        max_repo_mb:       Maximum repository size in MB.
-        session_id:        Pipeline session ID (generated if None).
-        auto_approve_hitl: If True, automatically approve HITL-1 checkpoint.
-
-    Returns:
-        Final PipelineState dict.
-    """
+    """Run the full PRISM pipeline synchronously."""
     sid = session_id or f"sess_{uuid.uuid4().hex[:12]}"
 
     if auto_approve_hitl:
@@ -736,19 +1028,18 @@ def run_pipeline(
     if isinstance(graph, _SequentialFallbackRunner):
         return graph.run(initial_state)
 
-    # LangGraph execution — run until completion or HITL pause
     config = {"configurable": {"thread_id": sid}}
     final_state = None
     for chunk in graph.stream(initial_state, config=config, stream_mode="values"):
         final_state = chunk
-        status = chunk.get("status")
         stage_results = chunk.get("stage_results", [])
         if stage_results:
             last = stage_results[-1]
             logger.info(
-                "  ▸ %-22s  %s  (%.0f ms)",
+                "  ▸ %-25s  %-8s  %.0f ms",
                 last["stage"], last["status"], last["duration_ms"],
             )
+        status = chunk.get("status")
         if status in (PipelineStatus.COMPLETE, PipelineStatus.FAILED,
                       PipelineStatus.HITL_WAIT):
             break
@@ -756,23 +1047,16 @@ def run_pipeline(
     return final_state or initial_state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sequential fallback (no langgraph installed)
-# ─────────────────────────────────────────────────────────────────────────────
+# Sequential fallback
 
 class _SequentialFallbackRunner:
-    """
-    Runs all pipeline nodes in sequence when LangGraph is not installed.
-    Produces the same final state as the graph-based runner.
-    Used in CI environments where the langgraph dependency is absent.
-    """
-
     def run(self, state: PipelineState) -> PipelineState:
-        # Run each node in order, merging partial updates into state
         stages = [
+            node_tool_health_check,
             node_ingestion,
             node_parsing,
             node_cpg_build,
+            node_codeql_analysis,
             node_sarif_annotation,
             node_hitl1_checkpoint,
             node_emit_audit,
@@ -780,29 +1064,21 @@ class _SequentialFallbackRunner:
         for fn in stages:
             try:
                 update = fn(state)
-                state = {**state, **update}   # type: ignore[assignment]
-                if state.get("status") in (
-                    PipelineStatus.FAILED, PipelineStatus.HITL_WAIT
-                ):
+                state  = {**state, **update}
+                if state.get("status") in (PipelineStatus.FAILED,
+                                           PipelineStatus.HITL_WAIT):
                     break
             except Exception as exc:
-                logger.exception("Sequential runner: stage %s failed", fn.__name__)
-                state = {**state,
-                         "status": PipelineStatus.FAILED,
-                         "error":  str(exc)}
+                logger.exception("Sequential runner: %s failed", fn.__name__)
+                state = {**state, "status": PipelineStatus.FAILED,
+                         "error": str(exc)}
                 break
-
         if state.get("status") != PipelineStatus.COMPLETE:
             node_handle_failure(state)
-
         return state
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Module-level ParsedGraphOutput cache
-# Avoids serialising large objects into LangGraph state.
-# Keyed by session_id; cleared by run_pipeline() on completion.
-# ─────────────────────────────────────────────────────────────────────────────
+# Parse output cache
 
 _PARSE_OUTPUT_CACHE: dict[str, list] = {}
 
@@ -815,11 +1091,9 @@ def _load_parse_outputs(session_id: str) -> list:
     return _PARSE_OUTPUT_CACHE.get(session_id, [])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# SARIF search helper
 
-def _find_sarif(sandbox: str) -> str | None:
-    """Search the sandbox directory for a CodeQL SARIF output file."""
+def _find_sarif(sandbox: str) -> "str | None":
     try:
         for p in Path(sandbox).rglob("*.sarif"):
             return str(p)
